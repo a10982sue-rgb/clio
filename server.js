@@ -22,8 +22,20 @@ const { logRequest } = require('./logger');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'brotato';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'kamilove32';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 8 * 1024 * 1024;
+
+// In-memory chat transcript log. Lives only in RAM — resets on restart. Capped
+// so a flood can't grow it without bound; oldest drop off.
+const CHAT_LOG_MAX = 1000;
+const chatLog = [];
+function logChat(rec) {
+  chatLog.push(rec);
+  if (chatLog.length > CHAT_LOG_MAX) chatLog.shift();
+}
+
+// --- helpers
 
 // --- helpers ---------------------------------------------------------------
 
@@ -40,6 +52,23 @@ function authed(req) {
   const m = /^Bearer\s+(.+)$/i.exec(bear);
   const token = (m && m[1]) || req.headers['x-api-key'] || '';
   return safeEqual(token.trim(), API_KEY);
+}
+
+// Admin auth: password lives only on the server (env var / default). The browser
+// never receives it; the login endpoint takes a posted password and returns a
+// short-lived signed-ish token (HMAC of timestamp over ADMIN_PASSWORD). Token is
+// sent back as a header for admin reads. No password ever reaches the HTML.
+function adminToken(now) {
+  const stamp = Math.floor((now || Date.now()) / 1000 / 300); // 5-min window
+  return crypto.createHmac('sha256', ADMIN_PASSWORD).update(String(stamp)).digest('hex');
+}
+function adminAuthed(req) {
+  const bear = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(bear);
+  const tok = (m && m[1]) || req.headers['x-admin-token'] || '';
+  // accept current window or previous (allows a token minted late in a window)
+  const now = Date.now();
+  return safeEqual(tok, adminToken(now)) || safeEqual(tok, adminToken(now - 300 * 1000));
 }
 
 function sendJson(res, status, obj) {
@@ -230,6 +259,9 @@ async function handleApiChat(req, res, body) {
 
   const oaiBody = anthropicToOpenAIRequest(anBody);
 
+  // Admin transcript capture: accumulate the assistant reply + thinking.
+  const reply = { text: '', thinking: '' };
+
   if (anBody.stream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -241,27 +273,58 @@ async function handleApiChat(req, res, body) {
         onSseEvent: (chunk) => {
           const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) || {};
           const ev = {};
-          if (d.reasoning_content) ev.thinking = d.reasoning_content;
-          if (d.content) ev.text = d.content;
+          if (d.reasoning_content) { ev.thinking = d.reasoning_content; reply.thinking += d.reasoning_content; }
+          if (d.content) { ev.text = d.content; reply.text += d.content; }
           if (chunk.usage) ev.usage = openAIToAnthropicUsage(chunk.usage);
           if (Object.keys(ev).length) res.write(`data: ${JSON.stringify(ev)}\n\n`);
         },
-        onEnd: () => { res.write('data: [DONE]\n\n'); res.end(); },
-        onError: (e) => { res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`); res.end(); },
+        onEnd: () => {
+          res.write('data: [DONE]\n\n'); res.end();
+          logChat({
+            ts: new Date().toISOString(), model: anBody.model,
+            messages: anBody.messages, reply: reply.text, thinking: reply.thinking,
+            stream: true, ok: true,
+          });
+        },
+        onError: (e) => {
+          res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`); res.end();
+          logChat({
+            ts: new Date().toISOString(), model: anBody.model,
+            messages: anBody.messages, reply: '', thinking: '',
+            stream: true, ok: false, error: e.message,
+          });
+        },
       });
     } catch (e) {
       if (!res.writableEnded) {
         res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
         res.end();
       }
+      logChat({
+        ts: new Date().toISOString(), model: anBody.model,
+        messages: anBody.messages, reply: '', thinking: '',
+        stream: true, ok: false, error: e.message,
+      });
     }
   } else {
     try {
       const oai = await callUpstream(oaiBody, {});
       const an = openAIToAnthropicResponse(oai);
       sendJson(res, 200, an);
+      const text = (an.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+      const think = (an.content || []).filter(b => b.type === 'thinking').map(b => b.thinking).join('');
+      logChat({
+        ts: new Date().toISOString(), model: anBody.model,
+        messages: anBody.messages, reply: text, thinking: think,
+        stream: false, ok: true, usage: an.usage,
+      });
     } catch (e) {
       sendJson(res, e.status || 502, { error: e.message });
+      logChat({
+        ts: new Date().toISOString(), model: anBody.model,
+        messages: anBody.messages, reply: '', thinking: '',
+        stream: false, ok: false, error: e.message,
+      });
     }
   }
 }
@@ -291,6 +354,31 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/chat') {
       handleApiChat(req, res, await readBody(req));
+      return;
+    }
+    if (req.method === 'POST' && p === '/api/admin/login') {
+      let lb; try { lb = JSON.parse(await readBody(req)); } catch { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (safeEqual(String(lb.password || ''), ADMIN_PASSWORD)) {
+        sendJson(res, 200, { token: adminToken(Date.now()) });
+      } else {
+        sendJson(res, 401, { error: 'wrong password' });
+      }
+      return;
+    }
+    if (req.method === 'GET' && p === '/api/admin/logs') {
+      if (!adminAuthed(req)) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      // newest first; include both chat transcripts and proxy request log if present
+      const requestLog = [];
+      try {
+        const lp = require('./logger').LOG_PATH;
+        if (fs.existsSync(lp)) {
+          for (const line of fs.readFileSync(lp, 'utf8').split('\n')) {
+            const s = line.trim(); if (!s) continue;
+            try { requestLog.push(JSON.parse(s)); } catch {}
+          }
+        }
+      } catch {}
+      sendJson(res, 200, { chats: chatLog.slice().reverse(), requests: requestLog.reverse() });
       return;
     }
     if (req.method === 'GET' && p === '/v1/models') {
