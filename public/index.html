@@ -83,6 +83,16 @@
   @keyframes sk{to{background-position:-200% 0}}
 
   code.inline{background:var(--bg);padding:1px 6px;border-radius:4px;font-size:12px;font-family:var(--mono);border:1px solid var(--border)}
+  .sys-wrap{margin-bottom:8px}
+  .sys-toggle{background:none;border:1px solid var(--border);color:var(--muted);font:inherit;font-size:12px;padding:4px 10px;border-radius:8px;cursor:pointer;margin-bottom:6px}
+  .sys-toggle:hover{color:var(--text);border-color:var(--border2)}
+  .sys-toggle.active{color:var(--accent);border-color:var(--accent)}
+  #sys{display:none;width:100%;resize:vertical;min-height:60px;max-height:160px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font:inherit;font-size:13px;line-height:1.5}
+  #sys.open{display:block}
+  #sys:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(108,140,255,.15)}
+  [hidden]{display:none!important}
+  .tab.flash{animation:flash .8s ease-out}
+  @keyframes flash{0%{box-shadow:0 0 0 3px rgba(108,140,255,.6)}100%{box-shadow:none}}
 </style>
 </head>
 <body>
@@ -93,7 +103,7 @@
     <div class="tabs">
       <button class="tab active" data-view="chat">Chat</button>
       <button class="tab" data-view="info">Base URL</button>
-      <button class="tab" id="adminTab">Admin</button>
+      <button class="tab" id="adminTab" hidden>Admin</button>
     </div>
     <span class="spacer"></span>
     <span class="hint" style="margin-right:2px">Thinking</span>
@@ -117,6 +127,10 @@
     </div>
     <div id="composer">
       <form id="f">
+        <div id="sysWrap" class="sys-wrap">
+          <button type="button" id="sysToggle" class="sys-toggle">System prompt</button>
+          <textarea id="sys" class="sys" placeholder="System prompt — applied to web chat only, not the API proxy" autocomplete="off"></textarea>
+        </div>
         <textarea id="in" placeholder="Send a message…" autocomplete="off" rows="1"></textarea>
         <div class="composer-row">
           <span class="hint">Enter to send · Shift+Enter for newline</span>
@@ -164,10 +178,35 @@
 <script>
 const $ = s => document.querySelector(s);
 const conv = $('#conv'), form = $('#f'), input = $('#in'), sendBtn = $('#send'), modelSel = $('#model'), effortSel = $('#effort');
+const sysInput = $('#sys'), sysToggle = $('#sysToggle'), adminTab = $('#adminTab');
 const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 const messages = [];
 let infoLoaded = false;
+
+/* --- hidden admin reveal: press ArrowUp 4 times within 1.5s --- */
+let upCount = 0, upTimer = null;
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowUp') return;
+  if (e.target === input || e.target === sysInput) return; // ignore while typing
+  e.preventDefault();
+  upCount++;
+  clearTimeout(upTimer);
+  upTimer = setTimeout(() => { upCount = 0; }, 1500);
+  if (upCount >= 4) {
+    upCount = 0;
+    adminTab.hidden = false;
+    adminTab.classList.add('flash');
+    setTimeout(() => adminTab.classList.remove('flash'), 1200);
+  }
+});
+
+/* --- system prompt toggle --- */
+sysToggle.addEventListener('click', () => {
+  const open = sysInput.classList.toggle('open');
+  sysToggle.classList.toggle('active', open);
+  if (open) sysInput.focus();
+});
 
 /* --- tabs --- */
 document.querySelectorAll('.tab').forEach(t => {
@@ -255,10 +294,13 @@ async function send(text){
   const aiB = addMsg('assistant'); aiB.classList.add('cursor');
   let thinkEl = null, textAcc = '';
 
+  const system = sysInput.value.trim();
+  const payload = { model: modelSel.value, effort: effortSel.value, messages, stream: true };
+  if (system) payload.system = system;
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: modelSel.value, effort: effortSel.value, messages, stream: true }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok || !res.body) {

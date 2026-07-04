@@ -92,6 +92,16 @@ function anthropicMessagesToOpenAI(messages) {
         } else if (b.type === 'thinking') {
           // OpenAI shape carries reasoning via delta.reasoning_content; for a
           // prefill/assistant turn we drop prior thinking (it's not replayed).
+        } else if (b.type === 'redacted_thinking') {
+          // Encrypted reasoning — opaque, not replayable upstream. Drop silently,
+          // matching Anthropic's own replay rules.
+        } else if (b.type === 'server_tool_use' || b.type === 'code_execution_tool_use') {
+          // Server-side tool invocations (web_search, code execution). The OpenAI
+          // upstream has no equivalent; preserve as a text summary so the model
+          // sees the prior action rather than losing it.
+          textParts.push(extraBlockToText(b));
+        } else {
+          textParts.push(extraBlockToText(b));
         }
       }
       const msg = { role: 'assistant' };
@@ -102,7 +112,8 @@ function anthropicMessagesToOpenAI(messages) {
     }
 
     if (m.role === 'user') {
-      // Split into image/text vs tool_result blocks.
+      // Split into tool_result vs everything else (text, image, document, server
+      // tool results, code execution results).
       const toolResults = m.content.filter((b) => b.type === 'tool_result');
       const other = m.content.filter((b) => b.type !== 'tool_result');
 
@@ -116,17 +127,58 @@ function anthropicMessagesToOpenAI(messages) {
         }
       }
       if (other.length) {
-        // Build a multimodal OpenAI content array (text + image_url).
+        // Build a multimodal OpenAI content array (text + image_url). Document and
+        // server-tool-result blocks collapse to text; PDF document sources are
+        // passed as text where possible since the OpenAI upstream has no document
+        // block equivalent.
         const parts = [];
         for (const b of other) {
-          if (b.type === 'text') parts.push({ type: 'text', text: b.text });
-          else if (b.type === 'image') {
+          if (b.type === 'text') {
+            parts.push({ type: 'text', text: b.text });
+          } else if (b.type === 'image') {
             const src = b.source || {};
             if (src.type === 'base64' && src.media_type && src.data) {
               parts.push({ type: 'image_url', image_url: { url: `data:${src.media_type};base64,${src.data}` } });
             } else if (src.type === 'url' && src.url) {
               parts.push({ type: 'image_url', image_url: { url: src.url } });
             }
+          } else if (b.type === 'document') {
+            // Anthropic document block: a source (text/pdf, base64|url) + optional
+            // title/context. If it's plain text, embed it inline; otherwise embed a
+            // citation header + any text content. We don't assume the upstream can
+            // consume raw PDF bytes, so we forward text where available.
+            const src = b.source || {};
+            let docText = '';
+            if (src.type === 'text' && typeof src.media_type === 'string' && src.data) {
+              docText = src.data; // text/plain document
+            } else if (src.type === 'url' && src.url) {
+              docText = `[document url: ${src.url}]`;
+            } else {
+              docText = `[document: ${src.media_type || 'application/octet-stream'}]`;
+            }
+            const header = b.title ? `Document: ${b.title}` : 'Document';
+            const ctx = b.context ? `\n${b.context}` : '';
+            parts.push({ type: 'text', text: `${header}${ctx}\n${docText}` });
+          } else if (b.type === 'web_search_tool_result') {
+            // Server-side web search result. Preserve citations as text.
+            const results = Array.isArray(b.content) ? b.content : [];
+            const lines = results.map((r) => {
+              const t = (r.text || '').trim();
+              const enc = Array.isArray(r.encodings) ? r.encodings.join(',') : '';
+              const url = r.url || '';
+              return `- ${r.title || '(untitled)'}${url ? ` — ${url}` : ''}${t ? `\n  ${t}` : ''}${enc ? `\n  [encodings: ${enc}]` : ''}`;
+            });
+            parts.push({ type: 'text', text: `Web search results:\n${lines.join('\n') || '(none)'}` });
+          } else if (b.type === 'code_execution_tool_result') {
+            const content = Array.isArray(b.content) ? b.content : [];
+            const parsed = content.map((c) => {
+              if (c.type === 'text') return c.text || '';
+              if (c.type === 'image') return '[image output]';
+              return '';
+            }).join('\n');
+            parts.push({ type: 'text', text: `Code execution result:\n${parsed}` });
+          } else {
+            parts.push({ type: 'text', text: extraBlockToText(b) });
           }
         }
         out.push({ role: 'user', content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts });
@@ -153,7 +205,58 @@ function anthropicToolToOpenAI(t) {
 
 function blocksToText(blocks) {
   if (!Array.isArray(blocks)) return '';
-  return blocks.map((b) => b.text || '').join('\n\n');
+  return blocks.map((b) => {
+    if (typeof b.text === 'string') return b.text;
+    if (b.type === 'thinking') return b.thinking || '';
+    if (b.type === 'redacted_thinking') return '[redacted thinking]';
+    if (b.type === 'server_tool_use' || b.type === 'code_execution_tool_use') return extraBlockToText(b);
+    if (b.type === 'web_search_tool_result') return '[web search results]';
+    if (b.type === 'code_execution_tool_result') return '[code execution result]';
+    if (b.type === 'document') return b.title ? `Document: ${b.title}` : '[document]';
+    return extraBlockToText(b);
+  }).filter(Boolean).join('\n\n');
+}
+
+// Collapse an unrecognized/extra Anthropic block into a readable text summary so
+// it survives the translation instead of being dropped. Keeps the model aware of
+// prior context (server tool calls, code execution, etc.) when the upstream has
+// no native equivalent.
+function extraBlockToText(b) {
+  if (!b || typeof b !== 'object') return '';
+  switch (b.type) {
+    case 'server_tool_use': {
+      const inp = typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {});
+      return `[server_tool_use: ${b.name || 'unknown'} ${inp}]`;
+    }
+    case 'code_execution_tool_use': {
+      const inp = typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {});
+      return `[code_execution_tool_use: ${inp}]`;
+    }
+    case 'web_search_tool_result': {
+      const results = Array.isArray(b.content) ? b.content : [];
+      const lines = results.map((r) => `- ${r.title || '(untitled)'}${r.url ? ` — ${r.url}` : ''}`);
+      return `Web search results:\n${lines.join('\n') || '(none)'}`;
+    }
+    case 'code_execution_tool_result': {
+      const content = Array.isArray(b.content) ? b.content : [];
+      const txt = content.map((c) => c.text || (c.type === 'image' ? '[image output]' : '')).join('\n');
+      return `Code execution result:\n${txt}`;
+    }
+    case 'document': {
+      const src = b.source || {};
+      const header = b.title ? `Document: ${b.title}` : 'Document';
+      let body = '';
+      if (src.type === 'text' && src.data) body = src.data;
+      else if (src.type === 'url' && src.url) body = `[document url: ${src.url}]`;
+      else body = `[document: ${src.media_type || 'application/octet-stream'}]`;
+      return `${header}\n${body}`;
+    }
+    case 'redacted_thinking':
+      return '[redacted thinking]';
+    default:
+      // Unknown block: preserve its JSON so downstream can see *something*.
+      try { return `[block:${b.type || 'unknown'} ${JSON.stringify(b)}]`; } catch { return `[block:${b.type || 'unknown'}]`; }
+  }
 }
 
 // ---------------------------------------------------------------------------
