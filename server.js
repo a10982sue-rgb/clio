@@ -486,7 +486,12 @@ const server = http.createServer(async (req, res) => {
           const lines = fs.readFileSync(LOG_PATH, 'utf8').split('\n');
           for (let i = lines.length - 1; i >= 0 && rows.length < limit; i--) {
             const s = lines[i].trim(); if (!s) continue;
-            try { const r = JSON.parse(s); if (r.ts && Date.parse(r.ts) >= since) rows.push(r); } catch {}
+            try {
+              const r = JSON.parse(s);
+              if (!r.ts || Date.parse(r.ts) < since) continue;
+              if (r.model && String(r.model).includes('haiku-4-5')) continue; // exclude haiku 4.5
+              rows.push(r);
+            } catch {}
           }
         }
       } catch {}
