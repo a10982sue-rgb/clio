@@ -24,8 +24,8 @@ const UPSTREAM_PORT = 443;
 // Timeouts (ms). Connect/headers is tight so a dead upstream fails fast; the
 // read timeout is per-gap-between-chunks, not total — a long stream with
 // regular chunks stays alive.
-const CONNECT_TIMEOUT_MS = parseInt(process.env.UPSTREAM_CONNECT_TIMEOUT_MS || '8000', 10);
-const HEADERS_TIMEOUT_MS = parseInt(process.env.UPSTREAM_HEADERS_TIMEOUT_MS || '20000', 10);
+const CONNECT_TIMEOUT_MS = parseInt(process.env.UPSTREAM_CONNECT_TIMEOUT_MS || '6000', 10);
+const HEADERS_TIMEOUT_MS = parseInt(process.env.UPSTREAM_HEADERS_TIMEOUT_MS || '10000', 10);
 const READ_TIMEOUT_MS = parseInt(process.env.UPSTREAM_READ_TIMEOUT_MS || '60000', 10);
 
 const MAX_CONCURRENT = parseInt(process.env.UPSTREAM_MAX_CONCURRENT || '64', 10);
@@ -197,7 +197,8 @@ function doRequest(oaiBody, hooks, attempt) {
     const fail = (e) => {
       if (settled) return; settled = true;
       timeouts.clearAll();
-      // One retry on a fresh connection for transient socket/connect errors.
+      tagTimeout(e); // mark 503 + transient for timeout/unreachable errors
+      // One retry on a fresh connection for transient socket/connect/timeout errors.
       if (attempt < 1 && isTransient(e)) {
         setImmediate(() => doRequest(oaiBody, hooks, attempt + 1).then(resolve, reject));
       } else {
@@ -216,7 +217,20 @@ function doRequest(oaiBody, hooks, attempt) {
 function isTransient(e) {
   if (!e) return false;
   const m = (e.message || '').toLowerCase();
-  return /econnreset|econnrefused|esockettimedout|etimedout|socket hang up|connect timeout|read timeout/.test(m);
+  return /econnreset|econnrefused|esockettimedout|etimedout|socket hang up|connect timeout|headers timeout|read timeout|upstream unavailable/.test(m);
+}
+
+// Tag timeout/upstream-unreachable errors so the proxy layer surfaces 503
+// instead of a bare 502, and so they're eligible for the one fresh-connection
+// retry in doRequest.
+function tagTimeout(e) {
+  if (!e) return e;
+  const m = (e.message || '').toLowerCase();
+  if (/timeout|econnrefused|econnreset|socket hang up/.test(m)) {
+    e.status = 503;
+    e.transient = true;
+  }
+  return e;
 }
 
 function callUpstream(oaiBody, hooks) {
