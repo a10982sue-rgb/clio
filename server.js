@@ -296,9 +296,20 @@ async function handleMessages(req, res, body) {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
+      // Disable any proxy buffering so SSE frames flush immediately. Without
+      // this, Railway's edge can buffer the whole stream and the client times
+      // out before the first event — a common "request failed retrying" cause.
+      'X-Accel-Buffering': 'no',
     });
     const enc = createAnthropicStreamEncoder(anBody.model);
     let usage = null;
+    // Anthropic sends periodic ping events during long generations to keep the
+    // connection alive; emit the same so strict clients don't time out while
+    // the upstream is still thinking.
+    const pingTimer = setInterval(() => {
+      if (!res.writableEnded) res.write('event: ping\ndata: {}\n\n');
+    }, 5000);
+    const stopPing = () => { clearInterval(pingTimer); };
     try {
       await callUpstream(oaiBody, {
         onSseEvent: (chunk) => {
@@ -309,6 +320,7 @@ async function handleMessages(req, res, body) {
           for (const e of enc.feedChunk(chunk)) writeSse(res, e);
         },
         onEnd: () => {
+          stopPing();
           for (const e of enc.flushEnd()) writeSse(res, e);
           res.end();
           logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
@@ -316,6 +328,7 @@ async function handleMessages(req, res, body) {
             stream: true, ok: true });
         },
         onError: (e) => {
+          stopPing();
           writeSse(res, { type: 'error', error: { type: 'api_error', message: e.message } });
           res.end();
           logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
@@ -325,6 +338,7 @@ async function handleMessages(req, res, body) {
       });
       logRequest({ ...meta, status: 200, usage, latencyMs: Date.now() - t0 });
     } catch (e) {
+      stopPing();
       if (!res.writableEnded) {
         writeSse(res, { type: 'error', error: { type: 'api_error', message: e.message } });
         res.end();

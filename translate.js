@@ -360,6 +360,8 @@ function createAnthropicStreamEncoder(model) {
     toolIndexToBlock: {},   // openai tool-call index -> anthropic block index
     blockOpen: false,
     messageId: 'msg_' + randomId(),
+    stopReason: null,       // recorded on finish_reason; emitted once at flush
+    usage: null,            // recorded from upstream usage; emitted once at flush
   };
   const out = [];
 
@@ -453,24 +455,18 @@ function createAnthropicStreamEncoder(model) {
       }
     }
 
-    // finish_reason -> message_delta + close
+    // finish_reason: record the stop reason, close the open block. The terminal
+    // message_delta + message_stop are emitted ONCE, at flushEnd, so we never
+    // produce duplicate message_stop events (which strict clients reject).
     if (choice?.finish_reason) {
+      state.stopReason = openAIToAnthropicStop(choice.finish_reason);
       const c = closeCurrent(); if (c) evs.push(c);
-      evs.push({
-        type: 'message_delta',
-        delta: { stop_reason: openAIToAnthropicStop(choice.finish_reason), stop_sequence: null },
-        usage: { output_tokens: 0 },
-      });
-      evs.push({ type: 'message_stop' });
     }
 
-    // usage often arrives on the final chunk with finish_reason
+    // usage often arrives on the final chunk with finish_reason. Record it for
+    // the single terminal message_delta; do not emit a second message_delta.
     if (oaiChunk.usage) {
-      evs.push({
-        type: 'message_delta',
-        delta: {},
-        usage: openAIToAnthropicUsage(oaiChunk.usage),
-      });
+      state.usage = openAIToAnthropicUsage(oaiChunk.usage);
     }
 
     return evs;
@@ -480,7 +476,13 @@ function createAnthropicStreamEncoder(model) {
     const evs = [];
     if (!state.started) evs.push(startMessage());
     if (state.blockOpen) { evs.push(closeCurrent()); }
-    evs.push({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } });
+    // Exactly one terminal message_delta (stop_reason + usage) then one
+    // message_stop. Duplicate message_stop is what breaks strict clients.
+    evs.push({
+      type: 'message_delta',
+      delta: { stop_reason: state.stopReason || 'end_turn', stop_sequence: null },
+      usage: state.usage || { output_tokens: 0 },
+    });
     evs.push({ type: 'message_stop' });
     return evs;
   }
