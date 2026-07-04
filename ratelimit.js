@@ -37,4 +37,41 @@ function createLimiter(windowMs, max) {
   };
 }
 
-module.exports = { createLimiter };
+// Global limiter: a single shared bucket regardless of client id. Caps total
+// load across all clients so a spammer rotating IPs can't evade the per-IP
+// limit. Use alongside createLimiter — reject if EITHER denies.
+function createGlobalLimiter(windowMs, max) {
+  const arr = [];
+  return {
+    check() {
+      const now = Date.now();
+      const cutoff = now - windowMs;
+      while (arr.length && arr[0] <= cutoff) arr.shift();
+      if (arr.length >= max) {
+        const retryMs = arr[0] + windowMs - now;
+        return { allowed: false, retryAfter: Math.max(1, Math.ceil(retryMs / 1000)) };
+      }
+      arr.push(now);
+      return { allowed: true, retryAfter: 0 };
+    },
+  };
+}
+
+// Concurrency cap: rejects when too many requests are in flight at once. This
+// is what actually protects an upstream from being nuked — a flood of
+// long-running streaming requests can stay under the RPM cap yet exhaust
+// sockets. Releases on the caller's finally().
+function createConcurrencyCap(max) {
+  let inFlight = 0;
+  return {
+    tryAcquire() {
+      if (inFlight >= max) return false;
+      inFlight++;
+      return true;
+    },
+    release() { if (inFlight > 0) inFlight--; },
+    get current() { return inFlight; },
+  };
+}
+
+module.exports = { createLimiter, createGlobalLimiter, createConcurrencyCap };

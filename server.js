@@ -26,17 +26,27 @@ const { callUpstream } = require('./upstream');
 const { openaiModelsList, anthropicModelsList, MODELS } = require('./models');
 const { logRequest, LOG_PATH } = require('./logger');
 const { duckSearch, resultsToAnthropicBlock } = require('./search');
-const { createLimiter } = require('./ratelimit');
+const { createLimiter, createGlobalLimiter, createConcurrencyCap } = require('./ratelimit');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'brotato';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 8 * 1024 * 1024;
 
-// Rate limit (requests per minute, per client IP). Override via env. The
-// Anthropic API tier-1 RPM is ~50; default here is conservative.
-const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '50', 10);
-const limiter = createLimiter(60 * 1000, RATE_LIMIT_RPM);
+// Rate limits.
+// Per-IP RPM: a single client can't exceed this in a rolling minute.
+// Global RPM: total across ALL clients — the real spam brake, since a flood
+//   rotating IPs evades the per-IP limit alone.
+// Concurrency: caps simultaneous in-flight model requests so a flood of
+//   long-running streams can't exhaust upstream sockets while staying under
+//   the RPM cap. Excess fail fast with 429.
+const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '30', 10);
+const GLOBAL_RPM = parseInt(process.env.GLOBAL_RPM || '120', 10);
+const MAX_CONCURRENT_REQS = parseInt(process.env.MAX_CONCURRENT_REQS || '24', 10);
+
+const ipLimiter = createLimiter(60 * 1000, RATE_LIMIT_RPM);
+const globalLimiter = createGlobalLimiter(60 * 1000, GLOBAL_RPM);
+const concurrency = createConcurrencyCap(MAX_CONCURRENT_REQS);
 
 // Client id for rate limiting: first x-forwarded-for hop, else socket IP.
 function clientId(req) {
@@ -45,22 +55,35 @@ function clientId(req) {
   return (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
-// Apply the RPM limit. On rejection, sends a 429 shaped like the Anthropic API
-// and returns true so the caller bails.
-function rateLimited(req, res, contractShape) {
-  const r = limiter.check(clientId(req));
-  if (r.allowed) return false;
+// Send a 429 shaped per contract. Returns the retry-after seconds used.
+function send429(res, contractShape, retryAfter, which) {
+  const msg = `${which} rate limit exceeded — retry in ${retryAfter}s`;
+  res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) });
   if (contractShape === 'anthropic') {
-    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(r.retryAfter) });
-    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `rate limit exceeded: ${RATE_LIMIT_RPM} req/min — retry in ${r.retryAfter}s` } }));
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: msg } }));
   } else if (contractShape === 'openai') {
-    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(r.retryAfter) });
-    res.end(JSON.stringify({ error: { type: 'rate_limit_error', message: `rate limit exceeded: ${RATE_LIMIT_RPM} req/min — retry in ${r.retryAfter}s` } }));
+    res.end(JSON.stringify({ error: { type: 'rate_limit_error', message: msg } }));
   } else {
-    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(r.retryAfter) });
-    res.end(JSON.stringify({ error: `rate limit exceeded — retry in ${r.retryAfter}s` }));
+    res.end(JSON.stringify({ error: msg }));
   }
-  return true;
+}
+
+// Combined gate: per-IP RPM + global RPM + concurrency. On any rejection sends
+// 429 and returns true so the caller bails. The caller MUST call
+// `releaseConcurrency()` in a finally once the request is done (only when this
+// returned false, i.e. the request was allowed through).
+function rateLimited(req, res, contractShape) {
+  const ip = limiterCheck(ipLimiter, clientId(req));
+  if (!ip.allowed) { send429(res, contractShape, ip.retryAfter, 'per-IP'); return { blocked: true }; }
+  const g = globalLimiter.check();
+  if (!g.allowed) { send429(res, contractShape, g.retryAfter, 'global'); return { blocked: true }; }
+  if (!concurrency.tryAcquire()) { send429(res, contractShape, 5, 'concurrency'); return { blocked: true }; }
+  return { blocked: false, release: () => concurrency.release() };
+}
+
+function limiterCheck(lim, id) {
+  // createLimiter returns {check}; createGlobalLimiter returns {check} too.
+  return lim.check(id);
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -444,24 +467,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'POST' && p === '/api/chat') {
-      if (rateLimited(req, res, 'web')) return;
-      handleApiChat(req, res, await readBody(req));
+      const gate = rateLimited(req, res, 'web');
+      if (gate.blocked) return;
+      try { await handleApiChat(req, res, await readBody(req)); }
+      finally { gate.release(); }
       return;
     }
     if (req.method === 'GET' && p === '/api/logs') {
       // Public, metadata-only request log: timestamp, contract, model, status,
       // usage, latency. No prompt or response text is stored or returned.
+      // Cap the response so it can't be used as a memory/DoS vector.
+      const u2 = new URL(req.url, 'http://localhost');
+      const limit = Math.min(parseInt(u2.searchParams.get('limit') || '200', 10), 500);
+      const since = parseInt(u2.searchParams.get('since') || '0', 10);
       const rows = [];
       try {
         if (fs.existsSync(LOG_PATH)) {
-          for (const line of fs.readFileSync(LOG_PATH, 'utf8').split('\n')) {
-            const s = line.trim(); if (!s) continue;
-            try { rows.push(JSON.parse(s)); } catch {}
+          const lines = fs.readFileSync(LOG_PATH, 'utf8').split('\n');
+          for (let i = lines.length - 1; i >= 0 && rows.length < limit; i--) {
+            const s = lines[i].trim(); if (!s) continue;
+            try { const r = JSON.parse(s); if (r.ts && Date.parse(r.ts) >= since) rows.push(r); } catch {}
           }
         }
       } catch {}
-      rows.reverse();
-      sendJson(res, 200, { requests: rows, rateLimitRpm: RATE_LIMIT_RPM });
+      sendJson(res, 200, { requests: rows, count: rows.length, rateLimitRpm: RATE_LIMIT_RPM, globalRpm: GLOBAL_RPM });
       return;
     }
     if (req.method === 'GET' && p === '/v1/models') {
@@ -471,8 +500,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'POST' && p === '/v1/messages') {
-      if (rateLimited(req, res, 'anthropic')) return;
-      handleMessages(req, res, await readBody(req));
+      const gate = rateLimited(req, res, 'anthropic');
+      if (gate.blocked) return;
+      try { await handleMessages(req, res, await readBody(req)); }
+      finally { gate.release(); }
       return;
     }
     if (req.method === 'POST' && p === '/v1/messages/count_tokens') {
@@ -485,8 +516,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'POST' && p === '/v1/chat/completions') {
-      if (rateLimited(req, res, 'openai')) return;
-      handleChatCompletions(req, res, await readBody(req));
+      const gate = rateLimited(req, res, 'openai');
+      if (gate.blocked) return;
+      try { await handleChatCompletions(req, res, await readBody(req)); }
+      finally { gate.release(); }
       return;
     }
     if (req.method === 'GET') {
