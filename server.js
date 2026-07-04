@@ -21,7 +21,7 @@ const {
 } = require('./translate');
 const { callUpstream } = require('./upstream');
 const { openaiModelsList, anthropicModelsList, MODELS } = require('./models');
-const { logRequest } = require('./logger');
+const { logRequest, LOG_PATH } = require('./logger');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'brotato';
@@ -29,6 +29,35 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 8 * 1024 * 1024;
 
 // --- helpers ---------------------------------------------------------------
+
+// Rough token estimate for /v1/messages/count_tokens. Agent SDKs (Claude Code,
+// Anthropic Agent SDK) call this during planning; a 404 breaks them. We don't
+// have a tokenizer, so use the standard ~4 chars/token heuristic with a small
+// per-message overhead. The upstream's real tokenizer is what bills, so this
+// only needs to be close enough for the SDK's context-budgeting logic.
+function estimateTokens(anBody) {
+  let chars = 0;
+  const addText = (s) => { if (typeof s === 'string') chars += s.length; };
+  addText(typeof anBody.system === 'string' ? anBody.system
+    : (Array.isArray(anBody.system) ? anBody.system.map(b => b.text || '').join('') : ''));
+  for (const m of (anBody.messages || [])) {
+    chars += 4; // role + framing overhead
+    if (typeof m.content === 'string') addText(m.content);
+    else if (Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b.type === 'text') addText(b.text);
+        else if (b.type === 'thinking') addText(b.thinking);
+        else if (b.type === 'tool_use') addText(JSON.stringify(b.input ?? {}));
+        else if (b.type === 'tool_result') {
+          if (typeof b.content === 'string') addText(b.content);
+          else if (Array.isArray(b.content)) addText(b.content.map(x => x.text || '').join(''));
+        } else addText(JSON.stringify(b));
+      }
+    }
+  }
+  for (const t of (anBody.tools || [])) chars += JSON.stringify(t).length;
+  return Math.max(1, Math.ceil(chars / 4));
+}
 
 function safeEqual(a, b) {
   const ab = Buffer.from(String(a));
@@ -307,6 +336,22 @@ const server = http.createServer(async (req, res) => {
       handleApiChat(req, res, await readBody(req));
       return;
     }
+    if (req.method === 'GET' && p === '/api/logs') {
+      // Public, metadata-only request log: timestamp, contract, model, status,
+      // usage, latency. NO prompt or response text is stored or returned.
+      const rows = [];
+      try {
+        if (fs.existsSync(LOG_PATH)) {
+          for (const line of fs.readFileSync(LOG_PATH, 'utf8').split('\n')) {
+            const s = line.trim(); if (!s) continue;
+            try { rows.push(JSON.parse(s)); } catch {}
+          }
+        }
+      } catch {}
+      rows.reverse(); // newest first
+      sendJson(res, 200, { requests: rows });
+      return;
+    }
     if (req.method === 'GET' && p === '/v1/models') {
       if (!authed(req)) { sendJson(res, 401, { error: { message: 'unauthorized' } }); return; }
       const isAnthropic = !!req.headers['anthropic-version'];
@@ -315,6 +360,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/v1/messages') {
       handleMessages(req, res, await readBody(req));
+      return;
+    }
+    if (req.method === 'POST' && p === '/v1/messages/count_tokens') {
+      // Agent SDKs (Claude Code, Anthropic Agent SDK) call this for context
+      // budgeting. No tokenizer available, so estimate. Auth matches the proxy.
+      if (!authed(req)) { sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'invalid api key' } }); return; }
+      let anBody; try { anBody = JSON.parse(await readBody(req)); }
+      catch { sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'invalid json' } }); return; }
+      sendJson(res, 200, { input_tokens: estimateTokens(anBody) });
       return;
     }
     if (req.method === 'POST' && p === '/v1/chat/completions') {

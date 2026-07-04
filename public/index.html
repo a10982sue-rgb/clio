@@ -91,6 +91,17 @@
   #sys.open{display:block}
   #sys:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(108,140,255,.15)}
   [hidden]{display:none!important}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:22px}
+  .stat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px}
+  .stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted2);margin-bottom:4px}
+  .stat .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+  .logrow{display:grid;grid-template-columns:auto 1fr auto auto auto;gap:12px;align-items:center;padding:10px 14px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px;background:var(--panel);font-size:13px}
+  .logrow .ts{font-family:var(--mono);font-size:11px;color:var(--muted2);white-space:nowrap}
+  .logrow .who{font-size:11px;background:var(--panel3);border:1px solid var(--border);border-radius:6px;padding:1px 7px;color:var(--muted)}
+  .logrow .tok{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .logrow .lat{font-family:var(--mono);font-size:12px;color:var(--muted2)}
+  .logrow .st{font-family:var(--mono);font-size:12px;font-weight:600}
+  .st.s2{color:var(--ok)} .st.s4{color:var(--err)} .st.s5{color:var(--warn)}
 </style>
 </head>
 <body>
@@ -101,6 +112,7 @@
     <div class="tabs">
       <button class="tab active" data-view="chat">Chat</button>
       <button class="tab" data-view="info">Base URL</button>
+      <button class="tab" data-view="logs">Logs</button>
     </div>
     <span class="spacer"></span>
     <span class="hint" style="margin-right:2px">Thinking</span>
@@ -170,6 +182,16 @@
       </div>
     </div>
   </div>
+
+  <!-- Logs view -->
+  <div id="logsView" class="view">
+    <div class="info-card">
+      <h2>Request logs</h2>
+      <p class="sub">Metadata only — model, status, tokens, latency. No prompt or response text is recorded.</p>
+      <div id="logsStats" class="stats"></div>
+      <div id="logsList"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -180,6 +202,7 @@ const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c
 
 const messages = [];
 let infoLoaded = false;
+const fmtTs = t => { try { return new Date(t).toLocaleString(); } catch { return t; } };
 
 /* --- system prompt toggle --- */
 sysToggle.addEventListener('click', () => {
@@ -194,12 +217,53 @@ document.querySelectorAll('.tab').forEach(t => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    const v = t.dataset.view === 'chat' ? '#chatView' : '#infoView';
+    const vmap = { chat:'#chatView', info:'#infoView', logs:'#logsView' };
+    const v = vmap[t.dataset.view] || '#chatView';
     $(v).classList.add('active');
     if (t.dataset.view === 'info') loadInfo();
+    if (t.dataset.view === 'logs') loadLogs();
     if (t.dataset.view === 'chat') input.focus();
   });
 });
+
+/* --- logs --- */
+async function loadLogs(){
+  const list = $('#logsList'), stats = $('#logsStats');
+  list.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const r = await fetch('/api/logs');
+    const d = await r.json();
+    const rows = d.requests || [];
+    const total = rows.length;
+    const ok = rows.filter(x => String(x.status).startsWith('2')).length;
+    const fail = total - ok;
+    const totIn = rows.reduce((a, x) => a + ((x.usage && x.usage.input_tokens) || 0), 0);
+    const totOut = rows.reduce((a, x) => a + ((x.usage && x.usage.output_tokens) || 0), 0);
+    stats.innerHTML = `
+      <div class="stat"><div class="k">Requests</div><div class="v">${total}</div></div>
+      <div class="stat"><div class="k">OK</div><div class="v" style="color:var(--ok)">${ok}</div></div>
+      <div class="stat"><div class="k">Failed</div><div class="v" style="color:var(--err)">${fail}</div></div>
+      <div class="stat"><div class="k">Tokens in/out</div><div class="v" style="font-size:16px">${totIn}/${totOut}</div></div>`;
+    if (!total) { list.innerHTML = '<div class="empty">No requests logged yet.</div>'; return; }
+    list.innerHTML = rows.map(q => {
+      const st = String(q.status || '?');
+      const cls = st.startsWith('2') ? 's2' : st.startsWith('4') ? 's4' : st.startsWith('5') ? 's5' : '';
+      const tok = q.usage ? `${q.usage.input_tokens || 0}→${q.usage.output_tokens || 0}` : '—';
+      const lat = q.latency_ms != null ? `${q.latency_ms}ms` : '';
+      const nm = q.msg_count != null ? `${q.msg_count} msg` : '';
+      return `<div class="logrow">
+        <span class="ts">${esc(fmtTs(q.ts))}</span>
+        <span class="who">${esc(q.contract || '')} · ${esc(q.model || '')}</span>
+        <span class="tok">${tok} ${nm ? `<span class="lat">· ${nm}</span>` : ''}${q.stream ? ' · stream' : ''}</span>
+        <span class="lat">${lat}</span>
+        <span class="st ${cls}">${esc(st)}</span>
+      </div>`;
+    }).join('');
+  } catch {
+    stats.innerHTML = '';
+    list.innerHTML = '<div class="empty">Failed to load logs.</div>';
+  }
+}
 
 /* --- copy buttons --- */
 document.querySelectorAll('.copy').forEach(b => {
