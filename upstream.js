@@ -17,7 +17,7 @@
 const https = require('https');
 const { URL } = require('url');
 
-const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'headers-forecasts-slope-did.trycloudflare.com';
+const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'olliechat-sw02.onrender.com';
 const UPSTREAM_PATH = '/api/chat';
 const UPSTREAM_PORT = 443;
 

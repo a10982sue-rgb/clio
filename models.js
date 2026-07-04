@@ -4,9 +4,15 @@
 // relay the error, so this list is advisory, not a gate.
 const MODELS = [
   { id: 'claude-fable-5',      label: 'Claude Fable 5' },
-  { id: 'claude-opus-4-8',     label: 'Claude Opus 4.8' },
-  { id: 'claude-sonnet-5',     label: 'Claude Sonnet 5' },
-  { id: 'claude-haiku-4-5',    label: 'Claude Haiku 4.5' },
+  { id: 'claude-sonnet-5',    label: 'Claude Sonnet 5' },
+  { id: 'claude-opus-4-8',    label: 'Claude Opus 4.8' },
+  { id: 'claude-haiku-4-5',   label: 'Claude Haiku 4.5' },
+  { id: 'glm-5.2',            label: 'Zhipu GLM 5.2' },
+  { id: 'glm-5.2-fast',       label: 'Zhipu GLM 5.2 Fast' },
+  { id: 'kimi-k2.7-code',     label: 'Moonshot Kimi K2.7 Code' },
+  { id: 'minimax-m3',         label: 'MiniMax M3' },
+  { id: 'qwen-3.7-plus',      label: 'Alibaba Qwen 3.7 Plus' },
+  { id: 'gpt-4o',             label: 'OpenAI GPT-4o' },
 ];
 
 function openaiModelsList() {
