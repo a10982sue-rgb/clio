@@ -91,8 +91,6 @@
   #sys.open{display:block}
   #sys:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(108,140,255,.15)}
   [hidden]{display:none!important}
-  .tab.flash{animation:flash .8s ease-out}
-  @keyframes flash{0%{box-shadow:0 0 0 3px rgba(108,140,255,.6)}100%{box-shadow:none}}
 </style>
 </head>
 <body>
@@ -103,7 +101,6 @@
     <div class="tabs">
       <button class="tab active" data-view="chat">Chat</button>
       <button class="tab" data-view="info">Base URL</button>
-      <button class="tab" id="adminTab" hidden>Admin</button>
     </div>
     <span class="spacer"></span>
     <span class="hint" style="margin-right:2px">Thinking</span>
@@ -178,28 +175,11 @@
 <script>
 const $ = s => document.querySelector(s);
 const conv = $('#conv'), form = $('#f'), input = $('#in'), sendBtn = $('#send'), modelSel = $('#model'), effortSel = $('#effort');
-const sysInput = $('#sys'), sysToggle = $('#sysToggle'), adminTab = $('#adminTab');
+const sysInput = $('#sys'), sysToggle = $('#sysToggle');
 const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 const messages = [];
 let infoLoaded = false;
-
-/* --- hidden admin reveal: press ArrowUp 4 times within 1.5s --- */
-let upCount = 0, upTimer = null;
-window.addEventListener('keydown', (e) => {
-  if (e.key !== 'ArrowUp') return;
-  if (e.target === input || e.target === sysInput) return; // ignore while typing
-  e.preventDefault();
-  upCount++;
-  clearTimeout(upTimer);
-  upTimer = setTimeout(() => { upCount = 0; }, 1500);
-  if (upCount >= 4) {
-    upCount = 0;
-    adminTab.hidden = false;
-    adminTab.classList.add('flash');
-    setTimeout(() => adminTab.classList.remove('flash'), 1200);
-  }
-});
 
 /* --- system prompt toggle --- */
 sysToggle.addEventListener('click', () => {
@@ -211,7 +191,6 @@ sysToggle.addEventListener('click', () => {
 /* --- tabs --- */
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
-    if (t.id === 'adminTab') { window.location.href = '/admin.html'; return; }
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
