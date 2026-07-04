@@ -96,6 +96,14 @@
       <button class="tab" id="adminTab">Admin</button>
     </div>
     <span class="spacer"></span>
+    <span class="hint" style="margin-right:2px">Thinking</span>
+    <select id="effort">
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high" selected>High</option>
+      <option value="xhigh">Max</option>
+      <option value="none">Off</option>
+    </select>
     <select id="model"></select>
   </header>
 
@@ -155,7 +163,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const conv = $('#conv'), form = $('#f'), input = $('#in'), sendBtn = $('#send'), modelSel = $('#model');
+const conv = $('#conv'), form = $('#f'), input = $('#in'), sendBtn = $('#send'), modelSel = $('#model'), effortSel = $('#effort');
 const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 const messages = [];
@@ -250,7 +258,7 @@ async function send(text){
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: modelSel.value, messages, stream: true }),
+    body: JSON.stringify({ model: modelSel.value, effort: effortSel.value, messages, stream: true }),
   });
 
   if (!res.ok || !res.body) {

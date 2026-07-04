@@ -346,11 +346,22 @@ async function handleApiChat(req, res, body) {
   const anBody = {
     model: inBody.model || MODELS[0].id,
     messages: inBody.messages || [],
-    max_tokens: inBody.max_tokens || 2048,
+    max_tokens: inBody.max_tokens || 4096,
     stream: !!inBody.stream,
   };
   if (inBody.system) anBody.system = inBody.system;
   if (typeof inBody.temperature === 'number') anBody.temperature = inBody.temperature;
+
+  // Thinking / reasoning effort. UI sends `effort` ('low'|'medium'|'high'|'xhigh'|'none').
+  // Map to an Anthropic thinking block so translate.js sets reasoning_effort accordingly.
+  // Default 'high' so the chat produces real reasoning, not instant answers.
+  const effort = String(inBody.effort || inBody.reasoning_effort || 'high').toLowerCase();
+  if (effort === 'none') {
+    anBody.thinking = { type: 'disabled' };
+  } else {
+    const budget = effort === 'xhigh' ? 24000 : effort === 'high' ? 12000 : effort === 'medium' ? 6000 : 2000;
+    anBody.thinking = { type: 'enabled', budget_tokens: budget };
+  }
 
   const oaiBody = anthropicToOpenAIRequest(anBody);
 

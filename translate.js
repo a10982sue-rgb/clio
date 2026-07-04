@@ -42,15 +42,18 @@ function anthropicToOpenAIRequest(body) {
 
   // Thinking. Anthropic: { type:'enabled', budget_tokens } or { type:'disabled' }.
   // Upstream exposes this as OpenAI-style reasoning_effort (low|medium|high|xhigh).
-  // Map a generous budget to 'high'; absence to disabled. We also honor a literal
-  // budget->effort heuristic so callers asking for thinking get it.
+  // Explicit enabled -> budget-mapped effort. Explicit disabled -> 'low' (some
+  // upstreams reject 'none'). No thinking field at all -> default 'high', so the
+  // proxy produces real reasoning by default rather than answering too fast.
   if (body.thinking && body.thinking.type === 'enabled') {
     const budget = body.thinking.budget_tokens || 0;
     out.reasoning_effort = budget >= 16000 ? 'xhigh'
       : budget >= 8000 ? 'high'
       : budget >= 2000 ? 'medium' : 'low';
-  } else {
+  } else if (body.thinking && body.thinking.type === 'disabled') {
     out.reasoning_effort = 'low';
+  } else {
+    out.reasoning_effort = 'high';
   }
 
   // stop_sequences -> stop
