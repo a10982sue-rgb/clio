@@ -243,7 +243,6 @@ document.querySelectorAll('.tab').forEach(t => {
 });
 
 /* --- logs --- */
-let logsView = 'chats';
 async function loadLogs(){
   const list = $('#logsList'), stats = $('#logsStats');
   list.innerHTML = '<div class="empty">Loading…</div>';
@@ -251,46 +250,19 @@ async function loadLogs(){
     const r = await fetch('/api/logs');
     const d = await r.json();
     const rows = d.requests || [];
-    const chats = d.chats || [];
-    const ttlMin = Math.round((d.chatTtlMs || 0) / 60000);
     const total = rows.length;
     const ok = rows.filter(x => String(x.status).startsWith('2')).length;
     const fail = total - ok;
     const totIn = rows.reduce((a, x) => a + ((x.usage && x.usage.input_tokens) || 0), 0);
     const totOut = rows.reduce((a, x) => a + ((x.usage && x.usage.output_tokens) || 0), 0);
-    const liveChats = chats.filter(c => c.reply !== '[expired]' && c.messages !== '[expired]').length;
     stats.innerHTML = `
       <div class="stat"><div class="k">Requests</div><div class="v">${total}</div></div>
-      <div class="stat"><div class="k">Live chats</div><div class="v">${liveChats}</div></div>
+      <div class="stat"><div class="k">OK</div><div class="v" style="color:var(--ok)">${ok}</div></div>
       <div class="stat"><div class="k">Failed</div><div class="v" style="color:var(--err)">${fail}</div></div>
       <div class="stat"><div class="k">Tokens in/out</div><div class="v" style="font-size:16px">${totIn}/${totOut}</div></div>`;
-    const toggle = `<div class="logs-toggle">
-      <button id="ltChats" class="${logsView==='chats'?'active':''}">Chats (${chats.length})</button>
-      <button id="ltReqs" class="${logsView==='reqs'?'active':''}">Requests (${total})</button>
-    </div>`;
-    const note = `<div class="meta-note">Chat content is shown for ${ttlMin} min after the request, then hidden. Rate limit: ${d.rateLimitRpm || '?'} req/min per IP.</div>`;
-    const renderChats = () => chats.length ? chats.map(c => {
-      const expired = c.messages === '[expired]';
-      const src = `<span class="src">${esc(c.source || '')}</span>`;
-      const badge = c.ok ? '<span class="badge ok" style="font-size:10px">ok</span>' : '<span class="badge fail" style="font-size:10px">fail</span>';
-      let turns = '';
-      if (expired) {
-        turns = '<div class="chat-turn expired"><div class="who">content</div>hidden — older than the disclosure window</div>';
-      } else {
-        turns = (Array.isArray(c.messages) ? c.messages : []).map(m => {
-          const cls = m.role === 'user' ? 'user' : (m.role === 'assistant' ? 'assistant' : 'thinking');
-          return `<div class="chat-turn ${cls}"><div class="who">${esc(m.role)}</div>${esc(m.text || '')}</div>`;
-        }).join('');
-        if (c.thinking) turns = `<div class="chat-turn thinking"><div class="who">thinking</div>${esc(c.thinking)}</div>` + turns;
-        if (c.reply) turns += `<div class="chat-turn assistant"><div class="who">assistant</div>${esc(c.reply)}</div>`;
-        if (!c.ok && c.error) turns += `<div class="chat-turn" style="color:var(--err)"><div class="who">error</div>${esc(c.error)}</div>`;
-      }
-      return `<div class="chat-entry">
-        <div class="head"><span class="ts">${esc(fmtTs(c.ts))}</span><span class="src">${esc(c.model||'')}</span>${src}${badge}</div>
-        ${turns}
-      </div>`;
-    }).join('') : '<div class="empty">No chats yet.</div>';
-    const renderReqs = () => total ? rows.map(q => {
+    const note = `<div class="meta-note">Metadata only — model, status, tokens, latency. No prompt or response text is recorded. Rate limit: ${d.rateLimitRpm || '?'} req/min per IP.</div>`;
+    if (!total) { list.innerHTML = note + '<div class="empty">No requests logged yet.</div>'; return; }
+    list.innerHTML = note + rows.map(q => {
       const st = String(q.status || '?');
       const cls = st.startsWith('2') ? 's2' : st.startsWith('4') ? 's4' : st.startsWith('5') ? 's5' : '';
       const tok = q.usage ? `${q.usage.input_tokens || 0}→${q.usage.output_tokens || 0}` : '—';
@@ -303,10 +275,7 @@ async function loadLogs(){
         <span class="lat">${lat}</span>
         <span class="st ${cls}">${esc(st)}</span>
       </div>`;
-    }).join('') : '<div class="empty">No requests logged yet.</div>';
-    list.innerHTML = toggle + note + (logsView === 'chats' ? renderChats() : renderReqs());
-    $('#ltChats')?.addEventListener('click', () => { logsView = 'chats'; loadLogs(); });
-    $('#ltReqs')?.addEventListener('click', () => { logsView = 'reqs'; loadLogs(); });
+    }).join('');
   } catch {
     stats.innerHTML = '';
     list.innerHTML = '<div class="empty">Failed to load logs.</div>';

@@ -283,19 +283,30 @@ function openAIToAnthropicResponse(oai) {
   const choice = oai.choices && oai.choices[0];
   const msg = choice?.message || {};
   const content = [];
-  let stopReason = 'end_turn';
+  const finishReason = choice?.finish_reason;
+  let stopReason = openAIToAnthropicStop(finishReason);
 
+  // Thinking block first (Anthropic orders reasoning before text/tool_use).
   if (typeof msg.reasoning_content === 'string' && msg.reasoning_content) {
-    content.push({ type: 'thinking', thinking: msg.reasoning_content });
+    content.push({
+      type: 'thinking',
+      thinking: msg.reasoning_content,
+      // Anthropic signs thinking blocks so they can't be tampered with on
+      // replay. We have no real signature key, so emit a stable placeholder
+      // shape — present so the block matches the official schema.
+      signature: 'ErUBCkYI' + randomId().slice(0, 8),
+    });
   }
 
-  if (Array.isArray(msg.tool_calls)) {
+  // Tool-use blocks before text when the model called tools, matching the
+  // real API's ordering on tool-turn responses.
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
     for (const tc of msg.tool_calls) {
       let input;
       try { input = JSON.parse(tc.function?.arguments || '{}'); } catch { input = {}; }
       content.push({
         type: 'tool_use',
-        id: tc.id,
+        id: (tc.id && /^toolu_/.test(tc.id)) ? tc.id : ('toolu_' + randomId().slice(0, 12)),
         name: tc.function?.name,
         input,
       });
@@ -309,13 +320,16 @@ function openAIToAnthropicResponse(oai) {
 
   if (content.length === 0) content.push({ type: 'text', text: '' });
 
+  // Anthropic's envelope: id is msg_<hex>, model is the requested id, and the
+  // usage object carries all four token fields. We coerce rather than trust
+  // the upstream's shape.
   return {
-    id: oai.id,
+    id: (oai.id && /^msg_/.test(oai.id)) ? oai.id : ('msg_' + randomId().slice(0, 24)),
     type: 'message',
     role: 'assistant',
     model: oai.model,
     content,
-    stop_reason: openAIToAnthropicStop(choice?.finish_reason),
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: openAIToAnthropicUsage(oai.usage),
   };
@@ -366,8 +380,15 @@ function createAnthropicStreamEncoder(model) {
   const out = [];
 
   function openText() { return blockStart('text', { text: '' }); }
-  function openThinking() { return blockStart('thinking', { thinking: '' }); }
-  function openToolUse(id, name) { return blockStart('tool_use', { id, name, input: '' }); }
+  function openThinking() {
+    // Anthropic signs thinking blocks; emit a placeholder signature so the
+    // streamed block matches the official content_block_start shape.
+    return blockStart('thinking', { thinking: '', signature: 'ErUBCkYI' + randomId().slice(0, 8) });
+  }
+  function openToolUse(id, name) {
+    const tid = (id && /^toolu_/.test(id)) ? id : ('toolu_' + randomId().slice(0, 12));
+    return blockStart('tool_use', { id: tid, name, input: '' });
+  }
 
   function blockStart(type, extra) {
     state.blockType = type;

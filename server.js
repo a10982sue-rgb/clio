@@ -3,10 +3,8 @@
 // - Exposes the translating proxy at /v1/* (auth required, key = API_KEY env, default "brotato")
 // - Exposes a first-party chat API at /api/chat + /api/models for the UI (no external key)
 //
-// Chat content (user messages + reply) is captured in-memory for a short
-// disclosure window (CHAT_TTL_MS, default 5 min), exposed at /api/logs so the
-// logs view can show recent chats. After the window, content is stripped and
-// only metadata remains. The durable request log (logger.js) is metadata-only.
+// No chat-content logging. /api/logs returns the metadata-only request log
+// (model/status/latency/usage) from logger.js — no prompt or response text.
 //
 // RPM rate limit on /v1/* and /api/chat, mirroring the Anthropic API: returns
 // 429 with retry-after once RATE_LIMIT_RPM requests land in the rolling minute.
@@ -35,58 +33,10 @@ const API_KEY = process.env.API_KEY || 'brotato';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 8 * 1024 * 1024;
 
-// Chat-content disclosure window. Captured text is visible in /api/logs only
-// for this long after the request; then content is replaced with '[expired]'.
-const CHAT_TTL_MS = parseInt(process.env.CHAT_TTL_MS || (5 * 60 * 1000), 10);
-const CHAT_LOG_MAX = 1000;
-
 // Rate limit (requests per minute, per client IP). Override via env. The
 // Anthropic API tier-1 RPM is ~50; default here is conservative.
 const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '50', 10);
 const limiter = createLimiter(60 * 1000, RATE_LIMIT_RPM);
-
-// In-memory recent-chat list. Each entry: { ts, tsMs, source, model, messages,
-// reply, thinking, stream, ok, error }. Content is stripped past CHAT_TTL_MS.
-const chatLog = [];
-function logChat(rec) {
-  chatLog.push({ ...rec, tsMs: Date.now() });
-  if (chatLog.length > CHAT_LOG_MAX) chatLog.shift();
-}
-// Strip expired content in place; return entries with a flag so the UI can tell.
-function exposedChatLog() {
-  const now = Date.now();
-  return chatLog.slice().reverse().map(e => {
-    if (now - e.tsMs > CHAT_TTL_MS) {
-      return { ...e, messages: '[expired]', reply: '[expired]', thinking: '[expired]' };
-    }
-    return e;
-  });
-}
-
-// Flatten a message list (Anthropic or OpenAI shape) into {role, text} rows.
-function normalizeMessages(msgs) {
-  if (!Array.isArray(msgs)) return [];
-  return msgs.map(m => {
-    let text = '';
-    const c = m.content;
-    if (typeof c === 'string') text = c;
-    else if (Array.isArray(c)) {
-      text = c.map(b => {
-        if (typeof b === 'string') return b;
-        if (b.type === 'text') return b.text || '';
-        if (b.type === 'thinking') return b.thinking || '';
-        if (b.type === 'tool_use') return `[tool_use: ${b.name || ''} ${typeof b.input === 'string' ? b.input : JSON.stringify(b.input || {})}]`;
-        if (b.type === 'tool_result') return `[tool_result: ${typeof b.content === 'string' ? b.content : (Array.isArray(b.content) ? b.content.map(x => x.text || '').join('') : '')}]`;
-        if (b.type === 'image' || b.type === 'image_url') return '[image]';
-        return b.text || '';
-      }).join('\n');
-    }
-    if (m.tool_calls && m.tool_calls.length) {
-      text += (text ? '\n' : '') + m.tool_calls.map(tc => `[tool_call: ${tc.function?.name || ''} ${tc.function?.arguments || ''}]`).join('\n');
-    }
-    return { role: m.role || 'unknown', text };
-  });
-}
 
 // Client id for rate limiting: first x-forwarded-for hop, else socket IP.
 function clientId(req) {
@@ -100,7 +50,6 @@ function clientId(req) {
 function rateLimited(req, res, contractShape) {
   const r = limiter.check(clientId(req));
   if (r.allowed) return false;
-  const headers = { 'Retry-After': String(r.retryAfter) };
   if (contractShape === 'anthropic') {
     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(r.retryAfter) });
     res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `rate limit exceeded: ${RATE_LIMIT_RPM} req/min — retry in ${r.retryAfter}s` } }));
@@ -289,7 +238,6 @@ async function handleMessages(req, res, body) {
   const oaiBody = anthropicToOpenAIRequest(anBody);
   const t0 = Date.now();
   const meta = { contract: 'anthropic', model: anBody.model, msgCount: (anBody.messages || []).length, stream: !!anBody.stream };
-  const reply = { text: '', thinking: '' };
 
   if (anBody.stream) {
     res.writeHead(200, {
@@ -314,26 +262,17 @@ async function handleMessages(req, res, body) {
       await callUpstream(oaiBody, {
         onSseEvent: (chunk) => {
           if (chunk.usage) usage = chunk.usage;
-          const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) || {};
-          if (d.content) reply.text += d.content;
-          if (d.reasoning_content) reply.thinking += d.reasoning_content;
           for (const e of enc.feedChunk(chunk)) writeSse(res, e);
         },
         onEnd: () => {
           stopPing();
           for (const e of enc.flushEnd()) writeSse(res, e);
           res.end();
-          logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
-            messages: normalizeMessages(anBody.messages), reply: reply.text, thinking: reply.thinking,
-            stream: true, ok: true });
         },
         onError: (e) => {
           stopPing();
           writeSse(res, { type: 'error', error: { type: 'api_error', message: e.message } });
           res.end();
-          logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
-            messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
-            stream: true, ok: false, error: e.message });
         },
       });
       logRequest({ ...meta, status: 200, usage, latencyMs: Date.now() - t0 });
@@ -344,27 +283,16 @@ async function handleMessages(req, res, body) {
         res.end();
       }
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
-      logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
-        messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
-        stream: true, ok: false, error: e.message });
     }
   } else {
     try {
       const oai = await callUpstream(oaiBody, {});
       const an = openAIToAnthropicResponse(oai);
       sendJson(res, 200, an);
-      const text = (an.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-      const think = (an.content || []).filter(b => b.type === 'thinking').map(b => b.thinking).join('');
       logRequest({ ...meta, status: 200, usage: oai.usage, latencyMs: Date.now() - t0 });
-      logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
-        messages: normalizeMessages(anBody.messages), reply: text, thinking: think,
-        stream: false, ok: true, usage: an.usage });
     } catch (e) {
       sendJson(res, e.status || 502, { type: 'error', error: { type: 'api_error', message: e.message } });
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
-      logChat({ ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
-        messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
-        stream: false, ok: false, error: e.message });
     }
   }
 }
@@ -382,33 +310,21 @@ async function handleChatCompletions(req, res, body) {
 
   const t0 = Date.now();
   const meta = { contract: 'openai', model: oaiBody.model, msgCount: (oaiBody.messages || []).length, stream: !!oaiBody.stream };
-  const reply = { text: '', thinking: '' };
-  const msgs = normalizeMessages(oaiBody.messages);
 
   if (oaiBody.stream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
     try {
       await callUpstream(oaiBody, {
-        onSseEvent: (chunk) => {
-          const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) || {};
-          if (d.content) reply.text += d.content;
-          if (d.reasoning_content) reply.thinking += d.reasoning_content;
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        },
-        onEnd: () => {
-          res.write('data: [DONE]\n\n'); res.end();
-          logChat({ ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
-            messages: msgs, reply: reply.text, thinking: reply.thinking, stream: true, ok: true });
-        },
+        onSseEvent: (chunk) => res.write(`data: ${JSON.stringify(chunk)}\n\n`),
+        onEnd: () => { res.write('data: [DONE]\n\n'); res.end(); },
         onError: (e) => {
           res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`);
           res.end();
-          logChat({ ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
-            messages: msgs, reply: '', thinking: '', stream: true, ok: false, error: e.message });
         },
       });
       logRequest({ ...meta, status: 200, latencyMs: Date.now() - t0 });
@@ -418,22 +334,15 @@ async function handleChatCompletions(req, res, body) {
         res.end();
       }
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
-      logChat({ ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
-        messages: msgs, reply: '', thinking: '', stream: true, ok: false, error: e.message });
     }
   } else {
     try {
       const oai = await callUpstream(oaiBody, {});
       sendJson(res, 200, oai);
-      const text = (oai.choices && oai.choices[0] && oai.choices[0].message && oai.choices[0].message.content) || '';
       logRequest({ ...meta, status: 200, usage: oai.usage, latencyMs: Date.now() - t0 });
-      logChat({ ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
-        messages: msgs, reply: text, thinking: '', stream: false, ok: true, usage: oai.usage });
     } catch (e) {
       sendJson(res, e.status || 502, { error: { message: e.message } });
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
-      logChat({ ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
-        messages: msgs, reply: '', thinking: '', stream: false, ok: false, error: e.message });
     }
   }
 }
@@ -473,61 +382,40 @@ async function handleApiChat(req, res, body) {
 
   await prepareWebSearch(anBody);
   const oaiBody = anthropicToOpenAIRequest(anBody);
-  const reply = { text: '', thinking: '' };
 
   if (anBody.stream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
     try {
       await callUpstream(oaiBody, {
         onSseEvent: (chunk) => {
           const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) || {};
           const ev = {};
-          if (d.reasoning_content) { ev.thinking = d.reasoning_content; reply.thinking += d.reasoning_content; }
-          if (d.content) { ev.text = d.content; reply.text += d.content; }
+          if (d.reasoning_content) ev.thinking = d.reasoning_content;
+          if (d.content) ev.text = d.content;
           if (chunk.usage) ev.usage = openAIToAnthropicUsage(chunk.usage);
           if (Object.keys(ev).length) res.write(`data: ${JSON.stringify(ev)}\n\n`);
         },
-        onEnd: () => {
-          res.write('data: [DONE]\n\n'); res.end();
-          logChat({ ts: new Date().toISOString(), source: 'web', model: anBody.model,
-            messages: normalizeMessages(anBody.messages), reply: reply.text, thinking: reply.thinking,
-            stream: true, ok: true });
-        },
-        onError: (e) => {
-          res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`); res.end();
-          logChat({ ts: new Date().toISOString(), source: 'web', model: anBody.model,
-            messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
-            stream: true, ok: false, error: e.message });
-        },
+        onEnd: () => { res.write('data: [DONE]\n\n'); res.end(); },
+        onError: (e) => { res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`); res.end(); },
       });
     } catch (e) {
       if (!res.writableEnded) {
         res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
         res.end();
       }
-      logChat({ ts: new Date().toISOString(), source: 'web', model: anBody.model,
-        messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
-        stream: true, ok: false, error: e.message });
     }
   } else {
     try {
       const oai = await callUpstream(oaiBody, {});
       const an = openAIToAnthropicResponse(oai);
       sendJson(res, 200, an);
-      const text = (an.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-      const think = (an.content || []).filter(b => b.type === 'thinking').map(b => b.thinking).join('');
-      logChat({ ts: new Date().toISOString(), source: 'web', model: anBody.model,
-        messages: normalizeMessages(anBody.messages), reply: text, thinking: think,
-        stream: false, ok: true, usage: an.usage });
     } catch (e) {
       sendJson(res, e.status || 502, { error: e.message });
-      logChat({ ts: new Date().toISOString(), source: 'web', model: anBody.model,
-        messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
-        stream: false, ok: false, error: e.message });
     }
   }
 }
@@ -561,9 +449,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'GET' && p === '/api/logs') {
-      // Public request log (metadata-only, from logger.js) + recent chat
-      // transcripts (in-memory, content shown only within CHAT_TTL_MS, then
-      // replaced with '[expired]'). Newest first.
+      // Public, metadata-only request log: timestamp, contract, model, status,
+      // usage, latency. No prompt or response text is stored or returned.
       const rows = [];
       try {
         if (fs.existsSync(LOG_PATH)) {
@@ -574,12 +461,7 @@ const server = http.createServer(async (req, res) => {
         }
       } catch {}
       rows.reverse();
-      sendJson(res, 200, {
-        requests: rows,
-        chats: exposedChatLog(),
-        chatTtlMs: CHAT_TTL_MS,
-        rateLimitRpm: RATE_LIMIT_RPM,
-      });
+      sendJson(res, 200, { requests: rows, rateLimitRpm: RATE_LIMIT_RPM });
       return;
     }
     if (req.method === 'GET' && p === '/v1/models') {
