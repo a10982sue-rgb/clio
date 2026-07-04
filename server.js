@@ -40,9 +40,9 @@ const MAX_BODY = 8 * 1024 * 1024;
 // Concurrency: caps simultaneous in-flight model requests so a flood of
 //   long-running streams can't exhaust upstream sockets while staying under
 //   the RPM cap. Excess fail fast with 429.
-const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '30', 10);
-const GLOBAL_RPM = parseInt(process.env.GLOBAL_RPM || '120', 10);
-const MAX_CONCURRENT_REQS = parseInt(process.env.MAX_CONCURRENT_REQS || '24', 10);
+const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '120', 10);
+const GLOBAL_RPM = parseInt(process.env.GLOBAL_RPM || '600', 10);
+const MAX_CONCURRENT_REQS = parseInt(process.env.MAX_CONCURRENT_REQS || '64', 10);
 
 const ipLimiter = createLimiter(60 * 1000, RATE_LIMIT_RPM);
 const globalLimiter = createGlobalLimiter(60 * 1000, GLOBAL_RPM);
@@ -490,7 +490,9 @@ const server = http.createServer(async (req, res) => {
           }
         }
       } catch {}
-      sendJson(res, 200, { requests: rows, count: rows.length, rateLimitRpm: RATE_LIMIT_RPM, globalRpm: GLOBAL_RPM });
+      const okCount = rows.filter(r => String(r.status).startsWith('2')).length;
+      const successRate = rows.length ? Math.round((okCount / rows.length) * 1000) / 10 : 100;
+      sendJson(res, 200, { requests: rows, count: rows.length, okCount, successRate, rateLimitRpm: RATE_LIMIT_RPM, globalRpm: GLOBAL_RPM });
       return;
     }
     if (req.method === 'GET' && p === '/v1/models') {

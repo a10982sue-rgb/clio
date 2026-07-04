@@ -295,14 +295,16 @@ async function loadLogs(){
     const total = rows.length;
     const ok = rows.filter(x => String(x.status).startsWith('2')).length;
     const fail = total - ok;
+    const sr = d.successRate != null ? d.successRate : (total ? Math.round((ok/total)*1000)/10 : 100);
+    const srColor = sr >= 90 ? 'var(--ok)' : sr >= 70 ? 'var(--warn,#ffa94d)' : 'var(--err)';
     const totIn = rows.reduce((a, x) => a + ((x.usage && x.usage.input_tokens) || 0), 0);
     const totOut = rows.reduce((a, x) => a + ((x.usage && x.usage.output_tokens) || 0), 0);
     stats.innerHTML = `
       <div class="stat"><div class="k">Requests</div><div class="v">${total}</div></div>
-      <div class="stat"><div class="k">OK</div><div class="v" style="color:var(--ok)">${ok}</div></div>
-      <div class="stat"><div class="k">Failed</div><div class="v" style="color:var(--err)">${fail}</div></div>
+      <div class="stat"><div class="k">Success rate</div><div class="v" style="color:${srColor}">${sr}%</div></div>
+      <div class="stat"><div class="k">OK / Failed</div><div class="v" style="font-size:16px"><span style="color:var(--ok)">${ok}</span> / <span style="color:var(--err)">${fail}</span></div></div>
       <div class="stat"><div class="k">Tokens in/out</div><div class="v" style="font-size:16px">${totIn}/${totOut}</div></div>`;
-    const note = `<div class="meta-note">Metadata only — model, status, tokens, latency. No prompt or response text is recorded. Rate limit: ${d.rateLimitRpm || '?'} req/min per IP.</div>`;
+    const note = `<div class="meta-note">Metadata only — model, status, tokens, latency. No prompt or response text is recorded. Limits: ${d.rateLimitRpm || '?'}/min per IP, ${d.globalRpm || '?'}/min global.</div>`;
     if (!total) { list.innerHTML = note + '<div class="empty">No requests logged yet.</div>'; return; }
     list.innerHTML = note + rows.map(q => {
       const st = String(q.status || '?');
