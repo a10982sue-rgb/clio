@@ -22,6 +22,7 @@ const {
 const { callUpstream } = require('./upstream');
 const { openaiModelsList, anthropicModelsList, MODELS } = require('./models');
 const { logRequest, LOG_PATH } = require('./logger');
+const { duckSearch, resultsToAnthropicBlock } = require('./search');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'brotato';
@@ -57,6 +58,58 @@ function estimateTokens(anBody) {
   }
   for (const t of (anBody.tools || [])) chars += JSON.stringify(t).length;
   return Math.max(1, Math.ceil(chars / 4));
+}
+
+// Detect Anthropic server-side web_search tool usage. Anthropic defines it as a
+// built-in server tool: { type: 'web_search_20250305', name: 'web_search', ... }
+// or a custom tool named 'web_search'. Our OpenAI-shaped upstream can't execute
+// server tools, so when the client enables it we run DuckDuckGo ourselves:
+// derive a query from the latest user message, search, and inject a
+// web_search_tool_result block into the conversation so the model sees real,
+// cited results. The server_tool_use/tool-result pair then round-trips cleanly
+// through translate.js.
+function hasWebSearchTool(anBody) {
+  return (anBody.tools || []).some(t => t.type === 'web_search_20250305' || t.name === 'web_search');
+}
+
+function extractSearchQuery(anBody) {
+  const msgs = anBody.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content.trim();
+    if (Array.isArray(m.content)) {
+      const texts = m.content.filter(b => b.type === 'text').map(b => b.text || '');
+      if (texts.length) return texts.join(' ').trim();
+    }
+  }
+  return '';
+}
+
+// Async pre-flight: if web_search is enabled, run it and mutate anBody to fold
+// the results into the conversation as a system-side search-result note. Returns
+// the results so the caller can also attach a web_search_tool_result block to
+// the assistant response if it wants.
+async function prepareWebSearch(anBody) {
+  if (!hasWebSearchTool(anBody)) return null;
+  const query = extractSearchQuery(anBody);
+  if (!query) return null;
+  const results = await duckSearch(query, { max: 6 });
+  if (!results.length) return null;
+
+  // Inject a user-role turn with the results as a search_result block, and a
+  // light system instruction telling the model to cite sources. This keeps the
+  // data in-band for any upstream (OpenAI-shaped) that lacks server tools.
+  const lines = results.map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\n${r.snippet}`);
+  const resultsText = `Web search results for "${query}":\n\n${lines.join('\n\n')}\n\nCite sources by URL when using these results.`;
+  anBody.messages = (anBody.messages || []).concat([
+    { role: 'user', content: [{ type: 'text', text: resultsText }] },
+  ]);
+  if (!anBody.system) anBody.system = '';
+  anBody.system = (anBody.system ? anBody.system + '\n\n' : '') +
+    'You have web search results inline in the conversation. Use them to answer; cite URLs.';
+
+  return { query, results, block: resultsToAnthropicBlock(results) };
 }
 
 function safeEqual(a, b) {
@@ -147,6 +200,7 @@ async function handleMessages(req, res, body) {
   try { anBody = JSON.parse(body); }
   catch { sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'invalid json' } }); return; }
 
+  await prepareWebSearch(anBody);
   const oaiBody = anthropicToOpenAIRequest(anBody);
   const t0 = Date.now();
   const meta = { contract: 'anthropic', model: anBody.model, msgCount: (anBody.messages || []).length, stream: !!anBody.stream };
@@ -271,6 +325,13 @@ async function handleApiChat(req, res, body) {
     anBody.thinking = { type: 'enabled', budget_tokens: budget };
   }
 
+  // UI web-search toggle: when on, declare the Anthropic web_search server tool
+  // so prepareWebSearch runs DuckDuckGo and injects real, cited results.
+  if (inBody.web_search) {
+    anBody.tools = (anBody.tools || []).concat([{ type: 'web_search_20250305', name: 'web_search' }]);
+  }
+
+  await prepareWebSearch(anBody);
   const oaiBody = anthropicToOpenAIRequest(anBody);
 
   if (anBody.stream) {

@@ -95,6 +95,14 @@ function anthropicMessagesToOpenAI(messages) {
         } else if (b.type === 'redacted_thinking') {
           // Encrypted reasoning — opaque, not replayable upstream. Drop silently,
           // matching Anthropic's own replay rules.
+        } else if (b.type === 'citation') {
+          // Anthropic citation block: cites a source for the preceding text.
+          // OpenAI has no equivalent; preserve as an inline citation marker so
+          // the model keeps the provenance context on replay.
+          const url = b.url || '';
+          const cited = Array.isArray(b.cited_text) ? b.cited_text.join(' ') : (b.cited_text || '');
+          const idx = b.start_citation ? `[cite:${b.start_citation}-${b.end_citation}]` : '[cite]';
+          textParts.push(`${idx} ${cited}${url ? ` (${url})` : ''}`.trim());
         } else if (b.type === 'server_tool_use' || b.type === 'code_execution_tool_use') {
           // Server-side tool invocations (web_search, code execution). The OpenAI
           // upstream has no equivalent; preserve as a text summary so the model
@@ -213,6 +221,10 @@ function blocksToText(blocks) {
     if (b.type === 'web_search_tool_result') return '[web search results]';
     if (b.type === 'code_execution_tool_result') return '[code execution result]';
     if (b.type === 'document') return b.title ? `Document: ${b.title}` : '[document]';
+    if (b.type === 'citation') {
+      const cited = Array.isArray(b.cited_text) ? b.cited_text.join(' ') : (b.cited_text || '');
+      return `${cited}${b.url ? ` (${b.url})` : ''}`.trim() || '[citation]';
+    }
     return extraBlockToText(b);
   }).filter(Boolean).join('\n\n');
 }
@@ -224,6 +236,10 @@ function blocksToText(blocks) {
 function extraBlockToText(b) {
   if (!b || typeof b !== 'object') return '';
   switch (b.type) {
+    case 'citation': {
+      const cited = Array.isArray(b.cited_text) ? b.cited_text.join(' ') : (b.cited_text || '');
+      return `${cited}${b.url ? ` (${b.url})` : ''}`.trim() || '[citation]';
+    }
     case 'server_tool_use': {
       const inp = typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {});
       return `[server_tool_use: ${b.name || 'unknown'} ${inp}]`;
