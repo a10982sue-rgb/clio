@@ -57,7 +57,40 @@
   @keyframes bl{50%{opacity:0}}
   .empty{max-width:780px;margin:auto;text-align:center;color:var(--muted2);padding:60px 20px}
   .empty h2{color:var(--muted);font-weight:500;font-size:18px;margin:0 0 6px}
-  .empty p{margin:0;font-size:14px}
+  .empty p{margin:0 0 18px;font-size:14px}
+  .empty .examples{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:10px}
+  .empty .ex{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:8px 14px;font-size:13px;color:var(--muted);cursor:pointer;transition:.15s}
+  .empty .ex:hover{color:var(--text);border-color:var(--accent);background:var(--panel2)}
+  .msg{animation:fade .25s ease-out}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  /* status pill */
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:3px 10px;margin-left:6px}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--muted2)}
+  .pill.ok .dot{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .pill.busy .dot{background:var(--warn,#ffa94d);animation:pulse 1s infinite}
+  .pill.err .dot{background:var(--err)}
+  @keyframes pulse{50%{opacity:.4}}
+  /* markdown inside bubbles */
+  .bubble p{margin:0 0 10px}.bubble p:last-child{margin:0}
+  .bubble strong{color:#fff}.bubble em{color:var(--text)}
+  .bubble a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(108,140,255,.3)}
+  .bubble a:hover{border-bottom-color:var(--accent)}
+  .bubble pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow:auto;margin:8px 0;font-family:var(--mono);font-size:12.5px}
+  .bubble code{font-family:var(--mono);font-size:12.5px}
+  .bubble pre code{background:none;border:none;padding:0;color:var(--text)}
+  .bubble :not(pre)>code{background:var(--bg);border:1px solid var(--border);padding:1px 5px;border-radius:4px}
+  .bubble ul,.bubble ol{margin:6px 0;padding-left:22px}
+  .bubble li{margin:2px 0}
+  .bubble blockquote{border-left:3px solid var(--border);margin:6px 0;padding:2px 12px;color:var(--muted)}
+  /* action row under assistant messages */
+  .actions{display:flex;gap:6px;margin-top:4px;padding:0 4px}
+  .act{background:none;border:1px solid transparent;color:var(--muted2);font:inherit;font-size:11px;padding:3px 8px;border-radius:6px;cursor:pointer;transition:.15s}
+  .act:hover{color:var(--text);border-color:var(--border)}
+  /* stop / clear buttons */
+  #stop{background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 18px;font:inherit;font-weight:600;cursor:pointer;display:none}
+  #stop:hover{border-color:var(--err);color:var(--err)}
+  .clear-btn{background:none;border:1px solid transparent;color:var(--muted2);font:inherit;font-size:12px;padding:4px 10px;border-radius:8px;cursor:pointer}
+  .clear-btn:hover{color:var(--err);border-color:var(--border)}
 
   /* info view */
   #infoView{padding:40px 20px}
@@ -124,12 +157,14 @@
   <header>
     <div class="logo">O</div>
     <h1>Ollie Chat</h1>
+    <span class="pill ok" id="statusPill"><span class="dot"></span><span id="statusText">ready</span></span>
     <div class="tabs">
       <button class="tab active" data-view="chat">Chat</button>
       <button class="tab" data-view="info">Base URL</button>
       <button class="tab" data-view="logs">Logs</button>
     </div>
     <span class="spacer"></span>
+    <button class="clear-btn" id="clearBtn" title="Clear conversation">Clear</button>
     <span class="hint" style="margin-right:2px">Thinking</span>
     <select id="effort">
       <option value="low">Low</option>
@@ -147,6 +182,12 @@
       <div class="empty" id="emptyState">
         <h2>Start a conversation</h2>
         <p>Pick a model and send a message. Responses stream in real time.</p>
+        <div class="examples">
+          <div class="ex" data-prompt="Explain async/await in JavaScript like I'm five">Explain async/await simply</div>
+          <div class="ex" data-prompt="Write a haiku about the ocean">Ocean haiku</div>
+          <div class="ex" data-prompt="What are three good names for a pet frog?">Pet frog names</div>
+          <div class="ex" data-prompt="Summarize the plot of Hamlet in one paragraph">Summarize Hamlet</div>
+        </div>
       </div>
     </div>
     <div id="composer">
@@ -160,6 +201,7 @@
           <label class="ws-toggle"><input type="checkbox" id="webSearch"> Web search</label>
           <span class="hint">Enter to send · Shift+Enter for newline</span>
           <span class="spacer" style="flex:1"></span>
+          <button id="stop" type="button">Stop</button>
           <button id="send" type="submit">Send</button>
         </div>
       </form>
@@ -327,14 +369,55 @@ async function loadModels(){
 loadModels();
 
 /* --- chat --- */
+const statusPill = $('#statusPill'), statusText = $('#statusText'), stopBtn = $('#stop'), clearBtn = $('#clearBtn');
+function setStatus(state, text){
+  statusPill.className = 'pill ' + state;
+  statusText.textContent = text;
+}
+setStatus('ok', 'ready');
+
+let currentReader = null, currentAbort = null;
+
 function scrollDown(){ conv.scrollTop = conv.scrollHeight; }
+
+// Minimal, safe markdown: escapes first, then applies a small subset. No raw
+// HTML ever reaches the bubble from model output.
+function md(src){
+  let s = esc(src);
+  // fenced code blocks
+  s = s.replace(/```([\s\S]*?)```/g, (_, c) => '<pre><code>' + c.replace(/^\n/, '') + '</code></pre>');
+  // inline code
+  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  // bold / italic
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, '$1<em>$2</em>');
+  // links [text](url) — url must be http(s)
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // headings
+  s = s.replace(/^### (.+)$/gm, '<strong>$1</strong>');
+  // blockquote
+  s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+  // unordered list
+  s = s.replace(/^(- .+(?:\n- .+)*)/gm, m => '<ul>' + m.split('\n').map(l => '<li>' + l.replace(/^- /, '') + '</li>').join('') + '</ul>');
+  // paragraphs + line breaks
+  s = s.split(/\n{2,}/).map(p => p.trim() ? '<p>' + p.replace(/\n/g, '<br>') + '</p>' : '').join('');
+  // don't wrap pre blocks twice
+  s = s.replace(/<p>(<pre>[\s\S]*?<\/pre>)<\/p>/g, '$1');
+  return s;
+}
 
 function addMsg(role){
   $('#emptyState')?.remove();
   const m = document.createElement('div'); m.className = 'msg ' + role;
   const r = document.createElement('div'); r.className = 'role'; r.textContent = role === 'user' ? 'You' : 'Assistant';
   const b = document.createElement('div'); b.className = 'bubble';
-  m.appendChild(r); m.appendChild(b); conv.appendChild(m); scrollDown();
+  m.appendChild(r); m.appendChild(b);
+  if (role === 'assistant') {
+    const act = document.createElement('div'); act.className = 'actions';
+    m.appendChild(act);
+    b._actions = act;
+  }
+  conv.appendChild(m); scrollDown();
   return b;
 }
 
@@ -347,30 +430,62 @@ function newThink(before){
   return body;
 }
 
-async function send(text){
-  messages.push({ role: 'user', content: text });
-  const userB = addMsg('user'); userB.textContent = text;
+// Humanize upstream/proxy errors so users know what to do.
+function humanError(msg, status){
+  const m = (msg || '').toLowerCase();
+  if (status === 429 || /rate limit/.test(m)) return 'Rate limit hit — wait a few seconds and retry.';
+  if (/upstream busy|try again shortly/.test(m)) return 'Server is overloaded right now — please retry in a moment.';
+  if (/timeout|timed out/.test(m)) return 'The request timed out. The model may be slow or the server busy — try again.';
+  if (status >= 500 || /econnreset|socket hang up|upstream 5/.test(m)) return 'Upstream error (' + status + '). The server had trouble reaching the model ��� retry shortly.';
+  if (status === 401) return 'Authentication failed — check the API key.';
+  return 'Error: ' + (msg || 'request failed').slice(0, 200);
+}
+
+async function send(text, { regenerate = false } = {}){
+  if (!regenerate) {
+    messages.push({ role: 'user', content: text });
+    const userB = addMsg('user'); userB.textContent = text;
+  }
 
   const aiB = addMsg('assistant'); aiB.classList.add('cursor');
   let thinkEl = null, textAcc = '';
+
+  setStatus('busy', 'thinking');
+  stopBtn.style.display = 'inline-block';
+  sendBtn.disabled = true;
+  currentAbort = new AbortController();
 
   const system = sysInput.value.trim();
   const payload = { model: modelSel.value, effort: effortSel.value, messages, stream: true };
   if (system) payload.system = system;
   if (webSearchCb.checked) payload.web_search = true;
-  const res = await fetch('/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+
+  let res;
+  try {
+    res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: currentAbort.signal,
+    });
+  } catch (e) {
+    aiB.classList.remove('cursor');
+    if (e.name === 'AbortError') { aiB.innerHTML = '<span class="err">Stopped.</span>'; }
+    else { aiB.innerHTML = '<span class="err">' + esc(humanError(e.message)) + '</span>'; setStatus('err', 'error'); }
+    finishSend(); return;
+  }
 
   if (!res.ok || !res.body) {
     aiB.classList.remove('cursor');
-    aiB.innerHTML = '<span class="err">Error: ' + esc((await res.text().catch(() => 'request failed')).slice(0, 400)) + '</span>';
-    return;
+    const body = await res.text().catch(() => '');
+    let em = body; try { em = (JSON.parse(body).error || body); } catch {}
+    aiB.innerHTML = '<span class="err">' + esc(humanError(em, res.status)) + '</span>';
+    setStatus('err', 'error');
+    finishSend(); return;
   }
 
   const reader = res.body.getReader();
+  currentReader = reader;
   const dec = new TextDecoder();
   let buf = '';
   try {
@@ -387,7 +502,8 @@ async function send(text){
         let ev; try { ev = JSON.parse(data); } catch { continue; }
         if (ev.error) {
           aiB.classList.remove('cursor');
-          aiB.innerHTML += '<span class="err">' + esc(ev.error) + '</span>';
+          aiB.innerHTML += '<span class="err">' + esc(humanError(ev.error)) + '</span>';
+          setStatus('err', 'error');
           continue;
         }
         if (ev.thinking) {
@@ -396,25 +512,82 @@ async function send(text){
         }
         if (ev.text) {
           aiB.classList.remove('cursor');
-          textAcc += ev.text; aiB.textContent = textAcc; scrollDown();
+          textAcc += ev.text; aiB.innerHTML = md(textAcc); scrollDown();
         }
       }
     }
+    setStatus('ok', 'ready');
   } catch (e) {
-    aiB.innerHTML += '<span class="err">\n\n(stream interrupted: ' + esc(e.message) + ')</span>';
+    if (e.name === 'AbortError') {
+      aiB.classList.remove('cursor');
+      if (textAcc) aiB.innerHTML = md(textAcc) + '<span class="err"> …stopped</span>';
+      else aiB.innerHTML = '<span class="err">Stopped.</span>';
+      setStatus('ok', 'ready');
+    } else {
+      aiB.innerHTML += '<span class="err">\n\n' + esc(humanError(e.message)) + '</span>';
+      setStatus('err', 'error');
+    }
   }
   aiB.classList.remove('cursor');
-  if (textAcc) messages.push({ role: 'assistant', content: textAcc });
+  if (textAcc) {
+    messages.push({ role: 'assistant', content: textAcc });
+    // action buttons under the finished assistant message
+    if (aiB._actions) {
+      const reg = document.createElement('button'); reg.className = 'act'; reg.textContent = 'Regenerate';
+      reg.addEventListener('click', () => regenerateLast(aiB));
+      const copy = document.createElement('button'); copy.className = 'act'; copy.textContent = 'Copy';
+      copy.addEventListener('click', () => { navigator.clipboard.writeText(textAcc); copy.textContent='Copied'; setTimeout(()=>copy.textContent='Copy',1200); });
+      aiB._actions.innerHTML = '';
+      aiB._actions.appendChild(reg); aiB._actions.appendChild(copy);
+    }
+  }
   scrollDown();
+  finishSend();
 }
+
+function finishSend(){
+  sendBtn.disabled = false;
+  stopBtn.style.display = 'none';
+  currentReader = null; currentAbort = null;
+}
+
+// Regenerate: drop the last assistant turn and re-run from the last user turn.
+function regenerateLast(aiB){
+  // remove last assistant message from history + DOM
+  if (messages[messages.length - 1]?.role === 'assistant') messages.pop();
+  const msgs = [...conv.querySelectorAll('.msg')];
+  const last = msgs[msgs.length - 1];
+  if (last && last.classList.contains('assistant')) last.remove();
+  // re-send without pushing a new user turn
+  send('', { regenerate: true });
+}
+
+stopBtn.addEventListener('click', () => {
+  if (currentAbort) { try { currentAbort.abort(); } catch {} }
+  if (currentReader) { try { currentReader.cancel(); } catch {} }
+});
+
+clearBtn.addEventListener('click', () => {
+  if (!confirm('Clear the whole conversation?')) return;
+  messages.length = 0;
+  conv.innerHTML = '<div class="empty" id="emptyState"><h2>Start a conversation</h2><p>Pick a model and send a message. Responses stream in real time.</p><div class="examples"><div class="ex" data-prompt="Explain async/await in JavaScript like I\'m five">Explain async/await simply</div><div class="ex" data-prompt="Write a haiku about the ocean">Ocean haiku</div><div class="ex" data-prompt="What are three good names for a pet frog?">Pet frog names</div><div class="ex" data-prompt="Summarize the plot of Hamlet in one paragraph">Summarize Hamlet</div></div></div>';
+  bindExamples();
+  setStatus('ok', 'ready');
+});
+
+function bindExamples(){
+  document.querySelectorAll('.ex').forEach(ex => {
+    ex.addEventListener('click', () => { input.value = ex.dataset.prompt; input.focus(); form.requestSubmit(); });
+  });
+}
+bindExamples();
 
 form.addEventListener('submit', e => {
   e.preventDefault();
   const t = input.value.trim();
   if (!t || sendBtn.disabled) return;
   input.value = ''; input.style.height = 'auto';
-  sendBtn.disabled = true;
-  send(t).finally(() => { sendBtn.disabled = false; input.focus(); });
+  send(t);
 });
 
 input.addEventListener('keydown', e => {
