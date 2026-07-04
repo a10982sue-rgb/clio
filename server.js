@@ -35,6 +35,35 @@ function logChat(rec) {
   if (chatLog.length > CHAT_LOG_MAX) chatLog.shift();
 }
 
+// Flatten a message list (Anthropic or OpenAI shape) into {role, text} rows for
+// the admin log. Pulls text out of string content, content-block arrays, and
+// OpenAI multimodal parts. Tool calls / images are summarized, not dropped.
+function normalizeMessages(msgs) {
+  if (!Array.isArray(msgs)) return [];
+  return msgs.map(m => {
+    let text = '';
+    const c = m.content;
+    if (typeof c === 'string') text = c;
+    else if (Array.isArray(c)) {
+      text = c.map(b => {
+        if (typeof b === 'string') return b;
+        if (b.type === 'text') return b.text || '';
+        if (b.type === 'thinking') return b.thinking || '';
+        if (b.type === 'tool_use') return `[tool_use: ${b.name || ''} ${typeof b.input === 'string' ? b.input : JSON.stringify(b.input || {})}]`;
+        if (b.type === 'tool_result') return `[tool_result: ${typeof b.content === 'string' ? b.content : (Array.isArray(b.content) ? b.content.map(x => x.text || '').join('') : '')}]`;
+        if (b.type === 'image') return '[image]';
+        if (b.type === 'image_url') return '[image]';
+        return b.text || '';
+      }).join('\n');
+    }
+    // OpenAI assistant tool_calls
+    if (m.tool_calls && m.tool_calls.length) {
+      text += (text ? '\n' : '') + m.tool_calls.map(tc => `[tool_call: ${tc.function?.name || ''} ${tc.function?.arguments || ''}]`).join('\n');
+    }
+    return { role: m.role || 'unknown', text };
+  });
+}
+
 // --- helpers
 
 // --- helpers ---------------------------------------------------------------
@@ -147,6 +176,7 @@ async function handleMessages(req, res, body) {
   const oaiBody = anthropicToOpenAIRequest(anBody);
   const t0 = Date.now();
   const meta = { contract: 'anthropic', model: anBody.model, msgCount: (anBody.messages || []).length, stream: !!anBody.stream };
+  const reply = { text: '', thinking: '' };
 
   if (anBody.stream) {
     res.writeHead(200, {
@@ -160,15 +190,28 @@ async function handleMessages(req, res, body) {
       await callUpstream(oaiBody, {
         onSseEvent: (chunk) => {
           if (chunk.usage) usage = chunk.usage;
+          const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) || {};
+          if (d.content) reply.text += d.content;
+          if (d.reasoning_content) reply.thinking += d.reasoning_content;
           for (const e of enc.feedChunk(chunk)) writeSse(res, e);
         },
         onEnd: () => {
           for (const e of enc.flushEnd()) writeSse(res, e);
           res.end();
+          logChat({
+            ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
+            messages: normalizeMessages(anBody.messages), reply: reply.text, thinking: reply.thinking,
+            stream: true, ok: true,
+          });
         },
         onError: (e) => {
           writeSse(res, { type: 'error', error: { type: 'api_error', message: e.message } });
           res.end();
+          logChat({
+            ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
+            messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
+            stream: true, ok: false, error: e.message,
+          });
         },
       });
       logRequest({ ...meta, status: 200, usage, latencyMs: Date.now() - t0 });
@@ -178,16 +221,33 @@ async function handleMessages(req, res, body) {
         res.end();
       }
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
+      logChat({
+        ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
+        messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
+        stream: true, ok: false, error: e.message,
+      });
     }
   } else {
     try {
       const oai = await callUpstream(oaiBody, {});
       const an = openAIToAnthropicResponse(oai);
       sendJson(res, 200, an);
+      const text = (an.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+      const think = (an.content || []).filter(b => b.type === 'thinking').map(b => b.thinking).join('');
       logRequest({ ...meta, status: 200, usage: oai.usage, latencyMs: Date.now() - t0 });
+      logChat({
+        ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
+        messages: normalizeMessages(anBody.messages), reply: text, thinking: think,
+        stream: false, ok: true, usage: an.usage,
+      });
     } catch (e) {
       sendJson(res, e.status || 502, { type: 'error', error: { type: 'api_error', message: e.message } });
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
+      logChat({
+        ts: new Date().toISOString(), source: 'proxy-anthropic', model: anBody.model,
+        messages: normalizeMessages(anBody.messages), reply: '', thinking: '',
+        stream: false, ok: false, error: e.message,
+      });
     }
   }
 }
@@ -205,6 +265,8 @@ async function handleChatCompletions(req, res, body) {
 
   const t0 = Date.now();
   const meta = { contract: 'openai', model: oaiBody.model, msgCount: (oaiBody.messages || []).length, stream: !!oaiBody.stream };
+  const reply = { text: '', thinking: '' };
+  const msgs = normalizeMessages(oaiBody.messages);
 
   if (oaiBody.stream) {
     res.writeHead(200, {
@@ -214,11 +276,28 @@ async function handleChatCompletions(req, res, body) {
     });
     try {
       await callUpstream(oaiBody, {
-        onSseEvent: (chunk) => res.write(`data: ${JSON.stringify(chunk)}\n\n`),
-        onEnd: () => { res.write('data: [DONE]\n\n'); res.end(); },
+        onSseEvent: (chunk) => {
+          const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) || {};
+          if (d.content) reply.text += d.content;
+          if (d.reasoning_content) reply.thinking += d.reasoning_content;
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        },
+        onEnd: () => {
+          res.write('data: [DONE]\n\n'); res.end();
+          logChat({
+            ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
+            messages: msgs, reply: reply.text, thinking: reply.thinking,
+            stream: true, ok: true,
+          });
+        },
         onError: (e) => {
           res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`);
           res.end();
+          logChat({
+            ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
+            messages: msgs, reply: '', thinking: '',
+            stream: true, ok: false, error: e.message,
+          });
         },
       });
       logRequest({ ...meta, status: 200, latencyMs: Date.now() - t0 });
@@ -228,15 +307,31 @@ async function handleChatCompletions(req, res, body) {
         res.end();
       }
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
+      logChat({
+        ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
+        messages: msgs, reply: '', thinking: '',
+        stream: true, ok: false, error: e.message,
+      });
     }
   } else {
     try {
       const oai = await callUpstream(oaiBody, {});
       sendJson(res, 200, oai);
+      const text = (oai.choices && oai.choices[0] && oai.choices[0].message && oai.choices[0].message.content) || '';
       logRequest({ ...meta, status: 200, usage: oai.usage, latencyMs: Date.now() - t0 });
+      logChat({
+        ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
+        messages: msgs, reply: text, thinking: '',
+        stream: false, ok: true, usage: oai.usage,
+      });
     } catch (e) {
       sendJson(res, e.status || 502, { error: { message: e.message } });
       logRequest({ ...meta, status: e.status || 502, error: e.message, latencyMs: Date.now() - t0 });
+      logChat({
+        ts: new Date().toISOString(), source: 'proxy-openai', model: oaiBody.model,
+        messages: msgs, reply: '', thinking: '',
+        stream: false, ok: false, error: e.message,
+      });
     }
   }
 }
@@ -281,7 +376,7 @@ async function handleApiChat(req, res, body) {
         onEnd: () => {
           res.write('data: [DONE]\n\n'); res.end();
           logChat({
-            ts: new Date().toISOString(), model: anBody.model,
+            ts: new Date().toISOString(), source: 'web', model: anBody.model,
             messages: anBody.messages, reply: reply.text, thinking: reply.thinking,
             stream: true, ok: true,
           });
@@ -289,7 +384,7 @@ async function handleApiChat(req, res, body) {
         onError: (e) => {
           res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`); res.end();
           logChat({
-            ts: new Date().toISOString(), model: anBody.model,
+            ts: new Date().toISOString(), source: 'web', model: anBody.model,
             messages: anBody.messages, reply: '', thinking: '',
             stream: true, ok: false, error: e.message,
           });
@@ -301,7 +396,7 @@ async function handleApiChat(req, res, body) {
         res.end();
       }
       logChat({
-        ts: new Date().toISOString(), model: anBody.model,
+        ts: new Date().toISOString(), source: 'web', model: anBody.model,
         messages: anBody.messages, reply: '', thinking: '',
         stream: true, ok: false, error: e.message,
       });
@@ -314,14 +409,14 @@ async function handleApiChat(req, res, body) {
       const text = (an.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
       const think = (an.content || []).filter(b => b.type === 'thinking').map(b => b.thinking).join('');
       logChat({
-        ts: new Date().toISOString(), model: anBody.model,
+        ts: new Date().toISOString(), source: 'web', model: anBody.model,
         messages: anBody.messages, reply: text, thinking: think,
         stream: false, ok: true, usage: an.usage,
       });
     } catch (e) {
       sendJson(res, e.status || 502, { error: e.message });
       logChat({
-        ts: new Date().toISOString(), model: anBody.model,
+        ts: new Date().toISOString(), source: 'web', model: anBody.model,
         messages: anBody.messages, reply: '', thinking: '',
         stream: false, ok: false, error: e.message,
       });

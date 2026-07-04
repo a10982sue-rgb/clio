@@ -49,6 +49,7 @@
   .badge.ok{background:rgba(81,207,142,.15);color:var(--ok);border:1px solid rgba(81,207,142,.3)}
   .badge.fail{background:rgba(255,107,107,.15);color:var(--err);border:1px solid rgba(255,107,107,.3)}
   .badge.stream{background:rgba(108,140,255,.15);color:var(--accent);border:1px solid rgba(108,140,255,.3)}
+  .badge.src{background:rgba(133,150,178,.15);color:var(--muted);border:1px solid var(--border);text-transform:none;letter-spacing:0}
 
   .turn{margin:6px 0;padding:10px 12px;border-radius:8px;border:1px solid var(--border);font-size:13px;white-space:pre-wrap;word-wrap:break-word}
   .turn .who{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted2);margin-bottom:4px;font-weight:600}
@@ -158,8 +159,11 @@ function render(){
     if (!c.length) { list.innerHTML = '<div class="empty">No chat transcripts yet.</div>'; return; }
     list.innerHTML = c.map(turn => {
       const msgs = (turn.messages || []).map(m => {
-        const txt = typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.map(b => b.text || b.thinking || '').join('\n') : '');
-        return `<div class="turn ${m.role}"><div class="who">${m.role}</div>${esc(txt)}</div>`;
+        // normalized form: { role, text }. legacy raw form: { role, content }.
+        const txt = (typeof m.text === 'string') ? m.text
+          : (typeof m.content === 'string' ? m.content
+            : (Array.isArray(m.content) ? m.content.map(b => b.text || b.thinking || '').join('\n') : ''));
+        return `<div class="turn ${esc(m.role)}"><div class="who">${esc(m.role)}</div>${esc(txt)}</div>`;
       }).join('');
       const reply = turn.reply
         ? `<div class="turn assistant"><div class="who">assistant</div>${esc(turn.reply)}</div>` : '';
@@ -168,8 +172,9 @@ function render(){
       const err = (!turn.ok && turn.error) ? `<div class="turn error"><div class="who">error</div>${esc(turn.error)}</div>` : '';
       const badge = turn.ok ? '<span class="badge ok">ok</span>' : '<span class="badge fail">fail</span>';
       const sbadge = turn.stream ? '<span class="badge stream">stream</span>' : '';
+      const src = turn.source ? `<span class="badge src">${esc(turn.source)}</span>` : '';
       return `<div class="entry">
-        <div class="entry-head"><span class="ts">${esc(fmtTs(turn.ts))}</span><span class="model">${esc(turn.model)}</span>${badge}${sbadge}</div>
+        <div class="entry-head"><span class="ts">${esc(fmtTs(turn.ts))}</span><span class="model">${esc(turn.model)}</span>${badge}${sbadge}${src}</div>
         ${msgs}${think}${reply}${err}
       </div>`;
     }).join('');
