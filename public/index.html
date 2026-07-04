@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ollie Chat</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c232c; --border:#30363d;
+    --text:#e6edf3; --muted:#8b949e; --user:#2a6; --ai:#5765f2; --err:#f85149;
+    --think:#6e7681;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}
+  #app{display:grid;grid-template-rows:auto 1fr auto;height:100%}
+  header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .spacer{flex:1}
+  select,input[type=text],textarea{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font:inherit}
+  #model{width:auto}
+  #conv{overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+  .msg{max-width:760px;width:100%;margin:0 auto;display:flex;flex-direction:column;gap:4px}
+  .role{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .bubble{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 14px;white-space:pre-wrap;word-wrap:break-word}
+  .msg.user .bubble{border-color:#2a6a4a;background:#13251c}
+  .think{color:var(--think);font-size:13px;border-left:2px solid var(--border);padding:2px 10px;margin:2px 0;white-space:pre-wrap}
+  .err{color:var(--err)}
+  #composer{border-top:1px solid var(--border);background:var(--panel);padding:12px 16px}
+  #composer form{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:8px}
+  #composer textarea{resize:vertical;min-height:64px;max-height:200px}
+  .row{display:flex;gap:8px;align-items:center}
+  #send{background:var(--ai);border:none;color:#fff;border-radius:8px;padding:8px 18px;font:inherit;cursor:pointer;font-weight:600}
+  #send:disabled{opacity:.5;cursor:default}
+  .hint{font-size:12px;color:var(--muted)}
+  code{background:#000;padding:1px 4px;border-radius:3px;font-size:13px}
+  .cursor::after{content:'▍';animation:bl 1s steps(1) infinite;color:var(--muted)}
+  @keyframes bl{50%{opacity:0}}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Ollie Chat</h1>
+    <span class="spacer"></span>
+    <label class="hint" for="model">Model</label>
+    <select id="model"></select>
+  </header>
+  <div id="conv"></div>
+  <div id="composer">
+    <form id="f">
+      <textarea id="in" placeholder="Send a message…" autocomplete="off"></textarea>
+      <div class="row">
+        <span class="hint">Enter to send · Shift+Enter newline</span>
+        <span class="spacer" style="flex:1"></span>
+        <button id="send" type="submit">Send</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const conv = $('#conv'), form = $('#f'), input = $('#in'), sendBtn = $('#send'), modelSel = $('#model');
+
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+const conversation = [{ role:'user' }]; // placeholder; rebuilt on first send
+
+function scrollDown(){ conv.scrollTop = conv.scrollHeight; }
+
+function addMsg(role){
+  const m = document.createElement('div'); m.className = 'msg ' + role;
+  const r = document.createElement('div'); r.className='role'; r.textContent = role==='user'?'You':'Assistant';
+  const b = document.createElement('div'); b.className='bubble';
+  m.appendChild(r); m.appendChild(b); conv.appendChild(m); scrollDown();
+  return b;
+}
+
+function newThink(before){
+  const t = document.createElement('div'); t.className='think';
+  before.parentElement.insertBefore(t, before);
+  return t;
+}
+
+async function loadModels(){
+  try{
+    const r = await fetch('/api/models');
+    const { models } = await r.json();
+    models.forEach(m => {
+      const o = document.createElement('option'); o.value=m.id; o.textContent=m.label; modelSel.appendChild(o);
+    });
+  }catch(e){ const o=document.createElement('option'); o.textContent='(model load failed)'; modelSel.appendChild(o); }
+}
+loadModels();
+
+const messages = []; // {role, content}
+
+async function send(text){
+  messages.push({ role:'user', content:text });
+  const userB = addMsg('user'); userB.textContent = text;
+
+  const aiB = addMsg('assistant'); aiB.classList.add('cursor');
+  let thinkEl = null, textAcc = '';
+
+  const res = await fetch('/api/chat', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ model: modelSel.value, messages, stream:true }),
+  });
+
+  if(!res.ok || !res.body){
+    aiB.classList.remove('cursor');
+    aiB.innerHTML = '<span class="err">Error: '+esc((await res.text().catch(()=>'request failed')).slice(0,300))+'</span>';
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+
+  try{
+    while(true){
+      const { value, done } = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, { stream:true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for(const raw of lines){
+        const s = raw.trim();
+        if(!s.startsWith('data:')) continue;
+        const data = s.slice(5).trim();
+        if(data === '[DONE]') continue;
+        let ev; try{ ev = JSON.parse(data); }catch{ continue; }
+        if(ev.error){
+          aiB.classList.remove('cursor');
+          aiB.innerHTML += '<span class="err">'+esc(ev.error)+'</span>';
+          continue;
+        }
+        if(ev.thinking){
+          if(!thinkEl){ thinkEl = newThink(aiB); }
+          thinkEl.textContent += ev.thinking;
+        }
+        if(ev.text){
+          aiB.classList.remove('cursor');
+          textAcc += ev.text;
+          aiB.textContent = textAcc;
+        }
+      }
+    }
+  }catch(e){
+    aiB.innerHTML += '<span class="err">\n\n(stream interrupted: '+esc(e.message)+')</span>';
+  }
+  aiB.classList.remove('cursor');
+  if(textAcc) messages.push({ role:'assistant', content:textAcc });
+  scrollDown();
+}
+
+form.addEventListener('submit', e => {
+  e.preventDefault();
+  const t = input.value.trim();
+  if(!t || sendBtn.disabled) return;
+  input.value=''; input.style.height='';
+  sendBtn.disabled = true;
+  send(t).finally(() => { sendBtn.disabled = false; input.focus(); });
+});
+
+input.addEventListener('keydown', e => {
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); form.requestSubmit(); }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+});
+input.focus();
+</script>
+</body>
+</html>
