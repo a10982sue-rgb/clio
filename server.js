@@ -489,7 +489,7 @@ const server = http.createServer(async (req, res) => {
             try {
               const r = JSON.parse(s);
               if (!r.ts || Date.parse(r.ts) < since) continue;
-              if (r.model && String(r.model).includes('haiku-4-5')) continue; // exclude haiku 4.5
+              if (r.model && /haiku/i.test(String(r.model))) continue; // exclude all haiku models
               rows.push(r);
             } catch {}
           }
