@@ -69,6 +69,17 @@ function writeSse(res, obj) {
   res.write(`event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
+// Derive the public base URL from the incoming request. Railway terminates TLS and
+// proxies through its edge, so the host is the real *.up.railway.app domain. We honor
+// x-forwarded-proto/host (set by Railway's proxy) and fall back to the direct Host header.
+function publicBaseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim()
+    || (req.connection && req.connection.encrypted ? 'https' : 'http');
+  const host = (req.headers['x-forwarded-host'] || '').split(',')[0].trim()
+    || req.headers['host'] || 'localhost';
+  return `${proto}://${host}`;
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -264,6 +275,18 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && p === '/api/models') {
       sendJson(res, 200, { models: MODELS });
+      return;
+    }
+    if (req.method === 'GET' && p === '/api/info') {
+      sendJson(res, 200, {
+        baseUrl: publicBaseUrl(req),
+        apiKey: API_KEY,
+        proxyPaths: {
+          anthropic: '/v1/messages',
+          openai: '/v1/chat/completions',
+          models: '/v1/models',
+        },
+      });
       return;
     }
     if (req.method === 'POST' && p === '/api/chat') {
